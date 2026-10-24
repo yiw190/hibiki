@@ -261,7 +261,14 @@ reaper.AnyTrackSolo = function()
   for _, t in ipairs(tracks) do if t.solo then return true end end
   return ui_solo == true
 end
-reaper.SetTrackUISolo = function(t, solo) hit("SetTrackUISolo") t.solo = solo ~= 0 end
+-- like REAPER: a selected track gangs every selected track unless igngroupflags has &2
+reaper.SetTrackUISolo = function(t, solo, flags)
+  hit("SetTrackUISolo")
+  if t.selected and ((flags or 0) & 2) == 0 then
+    for _, x in ipairs(tracks) do if x.selected then x.solo = solo ~= 0 end end
+  end
+  t.solo = solo ~= 0
+end
 reaper.IsProjectDirty = function() return project_dirty or 0 end
 reaper.PCM_Source_CreateFromFile = function(p) return { path = p } end
 reaper.GetMediaSourceLength = function() return 2.0 end

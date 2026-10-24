@@ -537,6 +537,7 @@ def main() -> None:
 
     n_tr = len(g.tracks)
     lua.execute("tracks[2].mute = true")
+    lua.execute("for _, t in ipairs(tracks) do t.selected = true end")  # selection ganging must not spread the solo
     r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "solo_render",
                                          "solo_indices": [0], "mute_indices": [2]}])
     seen = g.renders[len(g.renders)]
@@ -547,6 +548,7 @@ def main() -> None:
           all(not g.tracks[i]["solo"] for i in range(1, n_tr + 1)) and g.tracks[2]["mute"] is True
           and not g.tracks[3]["mute"], [(g.tracks[i]["solo"], g.tracks[i]["mute"]) for i in range(1, n_tr + 1)])
     lua.execute("tracks[2].mute = false")
+    lua.execute("for _, t in ipairs(tracks) do t.selected = false end")
 
     lua.execute("fake_gain = 10000")
     r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "quiet"}])

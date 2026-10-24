@@ -403,8 +403,9 @@ local function soloed_tracks()
   return out
 end
 
+-- igngroupflags 3: no group or selection ganging (flag 0 soloed every selected track along with t)
 local function set_solo(t, on)
-  if reaper.SetTrackUISolo then reaper.SetTrackUISolo(t, on and 1 or 0, 0) end
+  if reaper.SetTrackUISolo then reaper.SetTrackUISolo(t, on and 1 or 0, 3) end
   reaper.SetMediaTrackInfo_Value(t, "I_SOLO", on and 2 or 0) -- 2 = solo in place
 end
 
@@ -1368,7 +1369,7 @@ function DSL.render_project(path, opts)
   local function restore()
     if not snapshot then return end
     for _, s in ipairs(snapshot) do
-      if reaper.SetTrackUISolo then reaper.SetTrackUISolo(s.t, s.solo ~= 0 and 1 or 0, 0) end
+      if reaper.SetTrackUISolo then reaper.SetTrackUISolo(s.t, s.solo ~= 0 and 1 or 0, 3) end
       reaper.SetMediaTrackInfo_Value(s.t, "I_SOLO", s.solo)
       reaper.SetMediaTrackInfo_Value(s.t, "B_MUTE", s.mute)
     end
