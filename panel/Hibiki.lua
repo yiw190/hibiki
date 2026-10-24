@@ -2571,26 +2571,89 @@ local function bubble(holder, text)
 end
 
 ---------------------------------------------------------------- UI
-local function add_file(path, group) -- group: files that go and get removed together (one Ears run)
+-- attachments waiting in the composer (one table: the main chunk is at Lua's 200-local limit)
+local ATT = {}
+function ATT.add(path, group) -- group: files that go and get removed together (one Ears run)
   if type(path) ~= 'string' or path == '' then return end
   local f = io.open(path, 'rb')
   if not f then return end
   f:close()
   for _, x in ipairs(S.files) do if x.path == path then return end end
-  S.files[#S.files + 1] = { path = path, name = path:match('[^/]+$') or path, group = group }
+  S.files[#S.files + 1] = { path = path, name = path:match('[^/\\]+$') or path, group = group }
 end
-local function accept_file_drop() -- call right after the item that should take dropped files
+function ATT.drop() -- call right after the item that should take dropped files
   if ImGui.BeginDragDropTarget(ctx) then
     local rv, count = ImGui.AcceptDragDropPayloadFiles(ctx)
     if rv then
       for i = 0, count - 1 do
         local _, fn = ImGui.GetDragDropPayloadFile(ctx, i)
-        add_file(fn)
+        ATT.add(fn)
       end
       S.focus = true
     end
     ImGui.EndDragDropTarget(ctx)
   end
+end
+-- ImGui's paste only reads clipboard text. Files copied in Finder / Explorer attach (their text form is just the
+-- names), and so does an image with no text beside it (a screenshot), saved as a PNG. Rich text that also carries a
+-- picture stays text. First output line: files | image.
+ATT.JS = [=[
+ObjC.import('AppKit');
+function run(argv) {
+  var pb = argv[1] ? $.NSPasteboard.pasteboardWithName(argv[1]) : $.NSPasteboard.generalPasteboard; // argv[1]: tests
+  var only = $.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $.NSPasteboardURLReadingFileURLsOnlyKey);
+  var urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), only);
+  if (!urls.isNil() && urls.count > 0) {
+    var out = ['files'];
+    for (var i = 0; i < urls.count; i++) out.push(urls.objectAtIndex(i).path.js);
+    return out.join('\n');
+  }
+  var types = ObjC.deepUnwrap(pb.types) || [];
+  if (types.indexOf('public.utf8-plain-text') >= 0) return '';
+  var data = pb.dataForType('public.png');
+  if (data.isNil()) {
+    var tiff = pb.dataForType('public.tiff');
+    if (tiff.isNil()) return '';
+    data = $.NSBitmapImageRep.imageRepWithData(tiff).representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  }
+  return data.writeToFileAtomically(argv[0], true) ? 'image\n' + argv[0] : '';
+}
+]=]
+ATT.PS = [=[
+Add-Type -AssemblyName System.Windows.Forms
+$c = [Windows.Forms.Clipboard]
+if ($c::ContainsFileDropList()) { 'files'; $c::GetFileDropList() }
+elseif ($c::ContainsImage() -and -not $c::ContainsText()) {
+  $c::GetImage().Save($args[0], [Drawing.Imaging.ImageFormat]::Png); 'image'; $args[0]
+}
+]=]
+-- returns how many files it attached; Cmd+V on a composer that is being typed in
+function ATT.paste()
+  mkdir()
+  local png = DIR .. 'screenshot-' .. os.date('%Y%m%d-%H%M%S') .. '.png'
+  local script = DIR .. (WIN and 'clip.ps1' or 'clip.js')
+  local f = io.open(script, 'wb')
+  if not f then return 0 end
+  f:write(WIN and ATT.PS or ATT.JS)
+  f:close()
+  local out
+  if WIN then
+    out = reaper.ExecProcess('powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File ' .. q(script) .. ' ' .. q(png), 5000)
+    out = (out or ''):gsub('^%-?%d+\r?\n', '') -- ExecProcess puts the exit code on the first line
+  else
+    out = sh('/usr/bin/osascript -l JavaScript ' .. q(script) .. ' ' .. q(png) .. ' 2>/dev/null')
+  end
+  local kind, n = nil, 0
+  for line in out:gmatch('[^\r\n]+') do
+    if not kind then kind = line
+    elseif kind == 'files' or kind == 'image' then
+      local before = #S.files
+      ATT.add(line)
+      if #S.files > before then n = n + 1 end
+    end
+  end
+  if n > 0 then S.focus = true end
+  return n
 end
 
 -- longest prefix (whole UTF-8 characters) + "…" that fits w in the current font: binary search, cached per
@@ -3992,7 +4055,7 @@ do
     if ok and type(mod) == 'function' then
       ok, mod = pcall(mod, { ImGui = ImGui, ctx = ctx, S = S, C = C, EXT = EXT, DIR = DIR, WIN = WIN, decode = decode,
         jstr = jstr, q = q, sh = sh, win_bg = win_bg, http_url = http_url, gateway = HOSTS[1], cli = REC.cli,
-        add_file = add_file, chip = chip, led_toggle = led_toggle, primary = primary, wrapped = wrapped,
+        add_file = ATT.add, chip = chip, led_toggle = led_toggle, primary = primary, wrapped = wrapped,
         show_tip = show_tip, truncate = truncate })
     end
     if ok and type(mod) == 'table' then studio = mod
@@ -4106,7 +4169,7 @@ local function frame()
         ImGui.EndChild(ctx)
       end
       pm('log')
-      accept_file_drop() -- files dropped on the conversation attach too
+      ATT.drop() -- files dropped on the conversation attach too
       do -- the composer is a track-panel strip as well
         local _, cy = ImGui.GetCursorScreenPos(ctx)
         local wx, wy = ImGui.GetWindowPos(ctx)
@@ -4154,10 +4217,15 @@ local function frame()
       -- emptied S.input is what ImGui loads on activation. Never leave the flag pending for a later frame.
       if S.clear_input and S.comp_active then ImGui.Function_SetValue(ime_cb, 'clear', 1) end
       S.clear_input = false
+      -- Cmd+V with files / a screenshot on the clipboard: attach them, and undo the names ImGui pastes as text
+      if S.comp_active and (ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_V)
+          or ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Super | ImGui.Key_V)) and ATT.paste() > 0 then
+        ImGui.Function_SetValue(ime_cb, 'restore', 1)
+      end
       local before = S.input
       local entered
       entered, S.input = ImGui.InputTextMultiline(ctx, '##input', S.input, -1, 62, flags, ime_cb)
-      accept_file_drop()
+      ATT.drop()
       -- callback flags are one-frame requests: an inactive input never ran the callback, so drop them here
       ImGui.Function_SetValue(ime_cb, 'clear', 0)
       ImGui.Function_SetValue(ime_cb, 'restore', 0)
@@ -4172,7 +4240,7 @@ local function frame()
       if entered then send() end
       if chip('attach', '+ File', C.muted, false) then
         local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
-        if ok then add_file(fn) end
+        if ok then ATT.add(fn) end
       end
       ImGui.SameLine(ctx, 0, 4)
       context_chip()
@@ -4236,6 +4304,6 @@ if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
     ONB = ONB, REC = REC, UPD = UPD, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
     draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages,
-    demo_tick = demo_tick, studio = studio, card_list = card_list }
+    demo_tick = demo_tick, studio = studio, card_list = card_list, ATT = ATT }
 end
 reaper.defer(safe_frame)

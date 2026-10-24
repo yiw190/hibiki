@@ -30,9 +30,19 @@ HIBIKI_TEST = {
   sh = function(cmd)
     CMDS[#CMDS + 1] = cmd
     if cmd:find('curl -s -N', 1, true) then return '4242\n' end
+    if CLIP and cmd:find('osascript -l JavaScript', 1, true) then return clip_reply(cmd) end
     return ''
   end,
 }
+-- the clipboard probe's answer. CLIP: a list of files, or 'image' (writes the png the command names)
+function clip_reply(cmd)
+  if CLIP == 'image' then
+    local png = cmd:match("['\"]([^'\"]+%.png)['\"]")
+    local f = io.open(png, 'wb'); f:write('png'); f:close()
+    return 'image\n' .. png .. '\n'
+  end
+  return 'files\n' .. table.concat(CLIP, '\n') .. '\n'
+end
 local function nop() end
 reaper = setmetatable({
   ImGui_GetBuiltinPath = function() return '/nonexistent' end,
@@ -43,6 +53,7 @@ reaper = setmetatable({
   get_action_context = function() return false, '', 0, 0 end,
   GetResourcePath = function() return '/nonexistent' end,
   GetOS = function() return OS_NAME end,
+  ExecProcess = function(cmd) return (CLIP and cmd:find('clip.ps1', 1, true)) and ('0\n' .. clip_reply(cmd)) or nil end,
   GetLastColorThemeFile = function() return '' end,
   EnumProjects = function() return 0, '' end,
   GetProjectName = function() return 'Song.RPP' end,
@@ -320,6 +331,26 @@ def test_session_error_code_and_resume():
     p.lua.globals().NOW = p.lua.globals().NOW + 200
     p.m.frame()
     check("errored turn that never resumes is closed after the wait", ext["Hibiki/turn"] == "" and p.S.err == "Died")
+
+
+def test_paste_files_and_screenshot():
+    p = Panel(SESSION)
+    p.boot()
+    g = p.lua.globals()
+    a, b = p.tmp / "a.wav", p.tmp / "b.txt"
+    a.write_text("x"); b.write_text("y")
+    g.CLIP = p.lua.table_from([str(a), str(b), str(p.tmp / "missing.wav")])
+    n = p.m.ATT.paste()
+    check("paste: Finder files attach, a missing one is skipped",
+          n == 2 and [f.name for f in p.lua_list(p.S.files)] == ["a.wav", "b.txt"], n)
+    check("paste: the same files again add nothing", p.m.ATT.paste() == 0 and len(p.S.files) == 2)
+    g.CLIP = "image"
+    n = p.m.ATT.paste()
+    last = p.S.files[len(p.S.files)]
+    check("paste: a screenshot is saved as a png in the panel dir and attached",
+          n == 1 and last.name.startswith("screenshot-") and last.path.startswith(p.m.DIR), last.path)
+    g.CLIP = None
+    check("paste: text-only clipboard attaches nothing", p.m.ATT.paste() == 0)
 
 
 def test_follow_up_mid_reply():
