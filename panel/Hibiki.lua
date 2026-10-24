@@ -514,8 +514,29 @@ local function open_in_gamut()
   end
 end
 
+-- events that mean the turn is still running (after a session_error: Gamut recovered the runtime)
+-- a session_error'd turn: Gamut may recover the runtime and stream on (one table: the main chunk is at Lua's
+-- 200-local limit). wait: seconds it may still resume; resume: events that mean the turn is still running.
+local ERR = { wait = 120, resume = { session_active = true, stream_start = true, message_start = true,
+  stream_delta = true, tool_use_ready = true, permission_request = true } }
+
+-- an errored turn that never resumed: close it so its changes still get a Version history title
+function ERR.settle()
+  if not S.err_turn then return end
+  S.err_turn = nil
+  if studio then
+    local said = {}
+    for _, b in ipairs(S.live) do if b.kind == 'text' then said[#said + 1] = b.text end end
+    studio.turn_end(table.concat(said))
+  end
+end
+
 local function on_event(d)
   local t = d.type
+  if S.err_turn and ERR.resume[t] then
+    S.live[#S.live + 1] = { kind = 'tool', text = '⚠ ' .. (S.err or 'error') .. ' (resumed)' }
+    S.err, S.err_turn, S.active = nil, nil, true
+  end
   if t == 'connected' then
     S.active = d.isActive == true
     -- the gateway replays an ACP turn in progress right after this event; start the live view from that replay
@@ -577,7 +598,7 @@ local function on_event(d)
     if sval(d.requestId) then S.gans[sval(d.requestId)] = nil end
     if #S.greqs == 0 then S.waiting = false end
   elseif t == 'session_idle' then
-    S.active, S.waiting, S.perms = false, false, {}
+    S.active, S.waiting, S.perms, S.err_turn = false, false, {}, nil
     if studio then -- the reply's own words become its title in Version history
       local said = {}
       for _, b in ipairs(S.live) do if b.kind == 'text' then said[#said + 1] = b.text end end
@@ -589,11 +610,16 @@ local function on_event(d)
   elseif t == 'session_updated' then
     S.title_checks = { reaper.time_precise() }
   elseif t == 'session_error' then
+    -- Gamut recovers a runtime that died mid-turn and the same turn streams on, so the reply stays open
+    -- (studio turn, live view) until session_idle, more activity, or ERR.settle() gives up on it
     S.active, S.perms = false, {}
-    if studio then studio.turn_end() end
     if d.apiErrorCode == 'auth_required' and is_acp() then S.auth = S.auth or { methods = {} } end
     local p = d.errorPresentation
-    S.err = (type(p) == 'table' and (sval(p.message) or sval(p.title))) or sval(d.apiErrorCode) or 'error'
+    local msg = (type(p) == 'table' and (sval(p.message) or sval(p.title))) or sval(d.error)
+    local code = sval(d.apiErrorCode) or sval(d.terminalReason)
+      or (tonumber(d.apiErrorStatus) and ('HTTP ' .. math.floor(d.apiErrorStatus)))
+    S.err = (msg and code and not msg:find(code, 1, true)) and (msg .. ' (' .. code .. ')') or msg or code or 'error'
+    S.err_turn = reaper.time_precise()
     refresh_messages()
   end
 end
@@ -1282,6 +1308,7 @@ end
 local function deliver(payload, text, typed, files)
   local bubble = { role = 'user', text = payload }
   local queued = S.active and S.sid ~= ''
+  ERR.settle()
   if studio then studio.turn_start(queued) end
   if queued then
     S.queued[#S.queued + 1] = bubble -- the reply in progress stays above it
@@ -1387,6 +1414,7 @@ local function reset_view()
   stream_stop()
   S.gen = S.gen + 1 -- late callbacks from the previous view check this and drop their result
   if S.active and studio then studio.turn_end() end -- the abandoned reply's changes still get their card
+  ERR.settle()
   S.msgs, S.live, S.queued, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, {}, false, nil, false, {}, 0
   S.win_from = nil
   S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
@@ -1725,6 +1753,7 @@ do
     stream_stop()
     S.gen = S.gen + 1
     if S.active and studio then studio.turn_end() end -- the abandoned reply's changes still get their card
+    ERR.settle()
     S.active, S.waiting, S.perms, S.err, S.creating, S.uploading = false, false, {}, nil, false, false
     REC.running, REC.lines, REC.at = true, nil, reaper.time_precise()
     REC.job = REC.cli('recover', 'recover --json', finished)
@@ -3985,6 +4014,7 @@ local function frame()
   poll_stream()
   pm('sse')
   if studio then studio.tick(t0) end
+  if S.err_turn and t0 - S.err_turn > ERR.wait then ERR.settle() end
   demo_tick(t0)
   if S.title_checks and S.title_checks[1] and t0 >= S.title_checks[1] then
     table.remove(S.title_checks, 1)

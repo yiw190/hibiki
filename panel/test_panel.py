@@ -274,7 +274,7 @@ def test_connect_after_turn_ended():
     check("idle connect: the finished reply appears", len(p.S.msgs) == 2 and p.S.msgs[2].text == "the reply"
           and not p.S.active)
     p.sse({"type": "session_error", "apiErrorCode": "acp_error", "errorPresentation": {"message": "Fake: quota"}})
-    check("idle connect: a replayed error is shown", p.S.err == "Fake: quota", p.S.err)
+    check("idle connect: a replayed error is shown with its code", p.S.err == "Fake: quota (acp_error)", p.S.err)
 
 
 def test_connect_mid_turn_uses_replay():
@@ -283,6 +283,43 @@ def test_connect_mid_turn_uses_replay():
     p.sse({"type": "connected", "isActive": True}, {"type": "stream_delta", "text": "so far"})
     check("mid-turn connect: live view rebuilt from the replay, no reload",
           p.S.live[1].text == "so far" and p.S.active and not find(p.requests(), "GET", "/messages"))
+
+
+def test_session_error_code_and_resume():
+    p = Panel(SESSION)
+    p.boot()
+    p.sse({"type": "connected", "isActive": False})
+    p.requests()
+    sent = find(p.type_and_send("louder kick"), "POST", "/sessions/s1/messages")
+    p.reply(sent[0], 200, {"ok": True})
+    ext = p.lua.globals().EXT_STATE
+    turn = ext["Hibiki/turn"]
+    p.sse({"type": "stream_delta", "text": "working on it"},
+          {"type": "session_error", "error": "Connection lost", "apiErrorCode": None,
+           "terminalReason": "connection_lost", "isActive": False})
+    p.requests()
+    check("session_error: message and code shown", p.S.err == "Connection lost (connection_lost)", p.S.err)
+    check("session_error: the reply's studio turn stays open", turn and ext["Hibiki/turn"] == turn, ext["Hibiki/turn"])
+    p.sse({"type": "stream_delta", "text": " again"})
+    check("session_error then more output: the turn runs on, the error becomes a note in the reply",
+          p.S.active and p.S.err is None and ext["Hibiki/turn"] == turn
+          and any("connection_lost" in (b.text or "") and "resumed" in b.text for b in p.lua_list(p.S.live)),
+          [b.text for b in p.lua_list(p.S.live)])
+    p.sse({"type": "session_idle"})
+    check("session_idle after a resume closes the turn", ext["Hibiki/turn"] == "" and not p.S.active)
+
+    p.sse({"type": "session_error", "apiErrorCode": "rate_limited", "errorPresentation": {"message": "Slow down"}})
+    check("presentation message + api code", p.S.err == "Slow down (rate_limited)", p.S.err)
+    p.sse({"type": "session_error", "apiErrorStatus": 529})
+    check("bare status still says something", p.S.err == "HTTP 529", p.S.err)
+
+    sent = find(p.type_and_send("again"), "POST", "/sessions/s1/messages")
+    p.reply(sent[0], 200, {"ok": True})
+    p.sse({"type": "session_error", "error": "Died"})
+    check("errored turn kept open", ext["Hibiki/turn"] != "")
+    p.lua.globals().NOW = p.lua.globals().NOW + 200
+    p.m.frame()
+    check("errored turn that never resumes is closed after the wait", ext["Hibiki/turn"] == "" and p.S.err == "Died")
 
 
 def test_follow_up_mid_reply():
