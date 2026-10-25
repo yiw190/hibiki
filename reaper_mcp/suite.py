@@ -73,7 +73,7 @@ do
   if gid ~= 0 and reaper.GetToggleCommandState(gid) ~= 1 then reaper.Main_OnCommand(gid, 0) end
 end""",)
 LEGACY_PANEL_DIRS = ("GamutChat",)
-PANEL_FILES = ("Hibiki.lua", "studio.lua")  # Scripts/Hibiki/: the panel loads studio.lua next to itself
+PANEL_FILES = ("Hibiki.lua", "context.lua", "markdown.lua", "studio.lua")  # Scripts/Hibiki/: the panel loads its parts next to itself
 METER_JSFX = "Hibiki_Meter.jsfx"  # Effects/Hibiki/: the panel puts it on the master's monitoring FX
 
 # exact versions; bump deliberately. Only minimax runs install scripts: better-sqlite3 fetches its native
@@ -846,7 +846,8 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
 
 # ---------- dev mode: `hibiki use dev|release` ----------
 
-CHECKOUT_FILES = ("reaper_mcp/cli.py", "reaper_mcp/bridge.lua", "reaper_mcp/ears.py", "panel/Hibiki.lua", "panel/studio.lua",
+CHECKOUT_FILES = ("reaper_mcp/cli.py", "reaper_mcp/bridge.lua", "reaper_mcp/ears.py", "panel/Hibiki.lua", "panel/context.lua",
+                  "panel/markdown.lua", "panel/studio.lua",
                   "panel/Hibiki_Meter.jsfx", "gateway/agent_gateway.py")
 
 

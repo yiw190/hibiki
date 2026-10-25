@@ -685,617 +685,22 @@ local function poll_stream()
   end
 end
 
----------------------------------------------------------------- REAPER context
-local function pos(t) return reaper.format_timestr_pos(t, '', 2) end
-local NOTE = { 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B' }
-local function note_name(p) return NOTE[p % 12 + 1] .. (p // 12 - 1) end
-local function trnum(tr) return math.floor(reaper.GetMediaTrackInfo_Value(tr, 'IP_TRACKNUMBER')) end
-
-local function cc_kind(chanmsg, m2, m3)
-  if chanmsg == 0xB0 then return ('CC%d = %d'):format(m2, m3)
-  elseif chanmsg == 0xE0 then return ('pitch bend = %d'):format(((m3 << 7) | m2) - 8192)
-  elseif chanmsg == 0xC0 then return ('program %d'):format(m2)
-  elseif chanmsg == 0xD0 then return ('channel pressure = %d'):format(m2)
-  elseif chanmsg == 0xA0 then return ('poly aftertouch %s = %d'):format(note_name(m2), m3) end
-  return ('0x%X %d %d'):format(chanmsg, m2, m3)
+---------------------------------------------------------------- parts
+-- the panel's other files sit next to it (Scripts/Hibiki/); each returns a function that is called once with what
+-- it needs and returns its table. A missing or broken part stops the panel with the reason.
+local function load_part(name, P)
+  local dir = (select(2, reaper.get_action_context()) or ''):match('^(.*[/\\])') or ''
+  if HIBIKI_TEST then dir = HIBIKI_TEST.dir or dir end
+  local ok, mod = pcall(dofile, dir .. name)
+  if ok and type(mod) == 'function' then ok, mod = pcall(mod, P) end
+  if not ok or type(mod) ~= 'table' then
+    error('Hibiki: ' .. name .. ' did not load (' .. tostring(mod) .. '). Run `hibiki setup` to put it back.', 0)
+  end
+  return mod
 end
 
-local function midi_ctx(proj, full)
-  local ed = reaper.MIDIEditor_GetActive()
-  if not ed then return nil end
-  local take = reaper.MIDIEditor_GetTake(ed)
-  if not take or not reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then return nil end
-  local tr = reaper.GetMediaItemTake_Track(take)
-  local _, tn = reaper.GetTrackName(tr)
-  local _, total = reaper.MIDI_CountEvts(take)
-  local sel, list = 0, {}
-  local idx = reaper.MIDI_EnumSelNotes(take, -1)
-  while idx ~= -1 do
-    sel = sel + 1
-    if full and #list < 64 then
-      local _, _, _, sp, ep, ch, pitch, vel = reaper.MIDI_GetNote(take, idx)
-      local t0 = reaper.MIDI_GetProjTimeFromPPQPos(take, sp)
-      local t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
-      local len = reaper.TimeMap2_timeToQN(proj, t1) - reaper.TimeMap2_timeToQN(proj, t0)
-      list[#list + 1] = ('  note %d: %s @ %s, %.3g qn, vel %d, ch %d'):format(idx, note_name(pitch), pos(t0), len, vel, ch + 1)
-    end
-    idx = reaper.MIDI_EnumSelNotes(take, idx)
-  end
-  local r = { track = ('#%d %s'):format(trnum(tr), tn), sel = sel, total = total, list = list }
-  if full then
-    local item = reaper.GetMediaItemTake_Item(take)
-    r.item = pos(reaper.GetMediaItemInfo_Value(item, 'D_POSITION'))
-    local _, tk = reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false)
-    r.take = tk
-  end
-  if full then
-    local _, _, nccs = reaper.MIDI_CountEvts(take)
-    r.cc_total, r.cc_sel, r.cc_list = nccs, 0, {}
-    local ci = reaper.MIDI_EnumSelCC(take, -1)
-    while ci ~= -1 do
-      r.cc_sel = r.cc_sel + 1
-      if #r.cc_list < 64 then
-        local _, _, _, ppq, chanmsg, chan, m2, m3 = reaper.MIDI_GetCC(take, ci)
-        r.cc_list[#r.cc_list + 1] = ('  cc %d: %s @ %s, ch %d'):format(ci, cc_kind(chanmsg, m2, m3),
-          pos(reaper.MIDI_GetProjTimeFromPPQPos(take, ppq)), chan + 1)
-      end
-      ci = reaper.MIDI_EnumSelCC(take, ci)
-    end
-  end
-  return r
-end
-
-local function envelope_ctx(proj)
-  local env = reaper.GetSelectedEnvelope(proj)
-  if not env then return nil end
-  local _, ename = reaper.GetEnvelopeName(env)
-  local tr = reaper.Envelope_GetParentTrack(env)
-  local owner = '?'
-  if tr then
-    local _, tn = reaper.GetTrackName(tr)
-    owner = tr == reaper.GetMasterTrack(proj) and 'MASTER' or ('#%d %s'):format(trnum(tr), tn)
-  end
-  local n = reaper.CountEnvelopePoints(env)
-  local sel, list = 0, {}
-  for i = 0, n - 1 do
-    local _, t, v, shape, _, selected = reaper.GetEnvelopePoint(env, i)
-    if selected then
-      sel = sel + 1
-      if #list < 64 then
-        list[#list + 1] = ('  point %d: %s @ %s, shape %d'):format(i, reaper.Envelope_FormatValue(env, v), pos(t), shape)
-      end
-    end
-  end
-  return { head = ('selected envelope: %s on %s — %d of %d points selected%s'):format(ename, owner, sel, n,
-    sel > #list and (' (first ' .. #list .. ' listed)') or '') .. (sel > 0 and ':' or ''), list = list }
-end
-
-local function marker_ctx(proj, cur)
-  local mk, rg = reaper.GetLastMarkerAndCurRegion(proj, cur)
-  local r = {}
-  if rg >= 0 then
-    local _, _, p0, p1, name, num = reaper.EnumProjectMarkers3(proj, rg)
-    r.region_name = name
-    r.region = ('"%s" (region %d, %s–%s)'):format(name, num, pos(p0), pos(p1))
-  end
-  local around = {}
-  if mk >= 0 then
-    local _, _, p0, _, name, num = reaper.EnumProjectMarkers3(proj, mk)
-    around[#around + 1] = ('last %d "%s" @ %s'):format(num, name, pos(p0))
-  end
-  local _, nm, nr = reaper.CountProjectMarkers(proj)
-  for i = 0, (nm or 0) + (nr or 0) - 1 do
-    local _, isr, p0, _, name, num = reaper.EnumProjectMarkers3(proj, i)
-    if not isr and p0 > cur + 1e-9 then
-      around[#around + 1] = ('next %d "%s" @ %s'):format(num, name, pos(p0))
-      break
-    end
-  end
-  if #around > 0 then r.markers = table.concat(around, ', ') end
-  return r
-end
-
----------------------------------------------------------------- what the user selected, and when
--- REAPER keeps every selection kind until the user changes it, so a track picked minutes ago still reads as
--- selected next to a time selection made a second ago; sample each kind and remember when it last changed
-local SEL = { sig = {}, at = {}, t = 0 }
-local SEL_KINDS = { 'razor', 'time', 'items', 'tracks', 'notes', 'env', 'fx', 'cursor' }
-local SEL_LABEL = { razor = 'razor area', time = 'time selection', items = 'items', tracks = 'tracks',
-  notes = 'MIDI notes', env = 'envelope', fx = 'FX window', cursor = 'edit cursor' }
-
-local function sel_sigs(proj)
-  local g = {}
-  local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
-  g.time = e > s and (s .. ':' .. e) or ''
-  local rz = {}
-  for i = 0, reaper.CountTracks(proj) - 1 do
-    local _, v = reaper.GetSetMediaTrackInfo_String(reaper.GetTrack(proj, i), 'P_RAZOREDITS', '', false)
-    if v and v ~= '' then rz[#rz + 1] = i .. '=' .. v end
-  end
-  g.razor = table.concat(rz, '|')
-  local t = {}
-  for i = 0, reaper.CountSelectedTracks(proj) - 1 do t[#t + 1] = tostring(reaper.GetSelectedTrack(proj, i)) end
-  g.tracks = table.concat(t, ',')
-  local n = reaper.CountSelectedMediaItems(proj)
-  local it = {}
-  for i = 0, math.min(n, 64) - 1 do it[#it + 1] = tostring(reaper.GetSelectedMediaItem(proj, i)) end
-  g.items = n > 0 and (n .. ':' .. table.concat(it, ',')) or ''
-  local nt = {}
-  local ed = reaper.MIDIEditor_GetActive()
-  local take = ed and reaper.MIDIEditor_GetTake(ed)
-  if take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
-    local idx = reaper.MIDI_EnumSelNotes(take, -1)
-    while idx ~= -1 and #nt < 256 do nt[#nt + 1] = idx; idx = reaper.MIDI_EnumSelNotes(take, idx) end
-    if #nt > 0 then table.insert(nt, 1, tostring(take)) end
-  end
-  g.notes = table.concat(nt, ',')
-  local env = reaper.GetSelectedEnvelope(proj)
-  g.env = env and tostring(env) or ''
-  local rv, a, b, c = reaper.GetFocusedFX2()
-  g.fx = (rv and rv ~= 0) and (a .. ':' .. b .. ':' .. c) or ''
-  g.cursor = ('%.3f'):format(reaper.GetCursorPosition())
-  return g
-end
-
-local function spos(t) return (pos(t):gsub('%.00$', '')) end
-
-
--- one pill per selection kind for the row above the input; rebuilt when a selection changes
--- tooltips carry data only: positions, lengths, names, chord markers
-local function sel_pills(proj)
-  local P = {}
-  local function add(k, label, detail) P[#P + 1] = { k = k, label = label, detail = detail } end
-  local function span(t0, t1)
-    local num = reaper.TimeMap_GetTimeSigAtTime(proj, t0)
-    local qn = reaper.TimeMap2_timeToQN(proj, t1) - reaper.TimeMap2_timeToQN(proj, t0)
-    local bars = qn / (num or 4)
-    return ('%s–%s  (%s bar%s)'):format(spos(t0), spos(t1),
-      math.abs(bars - math.floor(bars + 0.5)) < 1e-6 and math.floor(bars + 0.5) or ('%.2f'):format(bars), bars == 1 and '' or 's')
-  end
-  local function chords(t0, t1)
-    local out = {}
-    local _, nm, nr = reaper.CountProjectMarkers(proj)
-    for i = 0, (nm or 0) + (nr or 0) - 1 do
-      local _, isr, p0, _, name, num = reaper.EnumProjectMarkers3(proj, i)
-      if not isr and p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 and #out < 12 then out[#out + 1] = spos(p0) .. ' ' .. name end
-    end
-    return #out > 0 and ('\n' .. table.concat(out, ' · ')) or ''
-  end
-  local function len_of(m)
-    local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
-    return p0, p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
-  end
-  local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
-  local rz, rt, lines = {}, {}, {}
-  for i = 0, reaper.CountTracks(proj) - 1 do
-    local tr = reaper.GetTrack(proj, i)
-    local _, v = reaper.GetSetMediaTrackInfo_String(tr, 'P_RAZOREDITS', '', false)
-    if v and v ~= '' then
-      local _, tn = reaper.GetTrackName(tr)
-      rt[#rt + 1] = ('#%d %s'):format(i + 1, tn)
-      for sa, sb in v:gmatch('(%S+) (%S+) "[^"]*"') do
-        local a, b = tonumber(sa), tonumber(sb)
-        rz.t0, rz.t1 = math.min(rz.t0 or a, a), math.max(rz.t1 or b, b)
-        if #lines < 12 then lines[#lines + 1] = ('#%d %s   %s–%s'):format(i + 1, tn, spos(a), spos(b)) end
-      end
-    end
-  end
-  if #rt > 0 then
-    add('razor', ('Razor  %s–%s · %s'):format(spos(rz.t0), spos(rz.t1), #rt == 1 and rt[1]:gsub('^#%d+ ', '') or (#rt .. ' tracks')),
-      table.concat(lines, '\n') .. chords(rz.t0, rz.t1))
-  end
-  if e > s then add('time', ('Time  %s–%s'):format(spos(s), spos(e)), span(s, e) .. chords(s, e)) end
-  local nt = reaper.CountSelectedTracks(proj)
-  if nt > 0 then
-    local names = {}
-    for i = 0, math.min(nt, 12) - 1 do
-      local t = reaper.GetSelectedTrack(proj, i)
-      local ni_ = reaper.CountTrackMediaItems(t)
-      names[#names + 1] = ('#%d %s   %d item%s%s'):format(trnum(t), select(2, reaper.GetTrackName(t)), ni_, ni_ == 1 and '' or 's',
-        reaper.GetMediaTrackInfo_Value(t, 'B_MUTE') == 1 and ', muted' or '')
-    end
-    if nt > 12 then names[#names + 1] = ('… +%d'):format(nt - 12) end
-    add('tracks', nt == 1 and ('Track  ' .. select(2, reaper.GetTrackName(reaper.GetSelectedTrack(proj, 0))))
-      or ('Tracks  ' .. nt), table.concat(names, '\n'))
-  end
-  local ni = reaper.CountSelectedMediaItems(proj)
-  if ni > 0 then
-    local L = {}
-    for i = 0, math.min(ni, 10) - 1 do
-      local m = reaper.GetSelectedMediaItem(proj, i)
-      local p0, p1 = len_of(m)
-      local tk = reaper.GetActiveTake(m)
-      local tkn = tk and select(2, reaper.GetSetMediaItemTakeInfo_String(tk, 'P_NAME', '', false)) or ''
-      L[#L + 1] = ('%s   %s – %s%s'):format(select(2, reaper.GetTrackName(reaper.GetMediaItem_Track(m))), pos(p0), pos(p1),
-        tkn ~= '' and ('   "' .. tkn .. '"') or '')
-    end
-    if ni > 10 then L[#L + 1] = ('… +%d'):format(ni - 10) end
-    local m = reaper.GetSelectedMediaItem(proj, 0)
-    local p0, p1 = len_of(m)
-    local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
-    add('items', ni == 1 and ('Item  %s %s–%s'):format(tn, spos(p0), spos(p1)) or ('Items  ' .. ni), table.concat(L, '\n'))
-  end
-  local ed = reaper.MIDIEditor_GetActive()
-  local take = ed and reaper.MIDIEditor_GetTake(ed)
-  if SEL.sig.notes and SEL.sig.notes ~= '' and take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
-    -- recounted only when the take's notes change (the hash covers selection too): a big MIDI item stays cheap
-    local _, hash = reaper.MIDI_GetHash(take, true, '')
-    local key = tostring(take) .. '\0' .. tostring(hash) .. '\0' .. SEL.sig.notes
-    local c = SEL.note_pill
-    if not c or c.key ~= key then
-      local n, lo, hi, first, last = 0, 128, -1, nil, nil
-      local idx = reaper.MIDI_EnumSelNotes(take, -1)
-      while idx ~= -1 do
-        n, first, last = n + 1, first or idx, idx
-        if n <= 2000 then
-          local _, _, _, _, _, _, pitch = reaper.MIDI_GetNote(take, idx)
-          lo, hi = math.min(lo, pitch), math.max(hi, pitch)
-        end
-        idx = reaper.MIDI_EnumSelNotes(take, idx)
-      end
-      local t0, t1 = 0, 0
-      if first then
-        local _, _, _, sp = reaper.MIDI_GetNote(take, first)
-        local _, _, _, _, ep = reaper.MIDI_GetNote(take, last)
-        t0, t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, sp), reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
-      end
-      c = { key = key, n = n, detail = n > 0 and ('%d note%s, %s–%s\n%s – %s'):format(n, n == 1 and '' or 's',
-        note_name(lo), note_name(hi), pos(t0), pos(t1)) or '' }
-      SEL.note_pill = c
-    end
-    local _, tn = reaper.GetTrackName(reaper.GetMediaItemTake_Track(take))
-    if c.n > 0 then add('notes', ('Notes  %d in %s'):format(c.n, tn), c.detail) end
-  end
-  local env = reaper.GetSelectedEnvelope(proj)
-  if env then
-    local _, en = reaper.GetEnvelopeName(env)
-    local tr = reaper.Envelope_GetParentTrack(env)
-    local np = reaper.CountEnvelopePoints(env)
-    add('env', 'Envelope  ' .. en, ('%s on %s\n%d point%s'):format(en,
-      tr and ('#%d %s'):format(trnum(tr), select(2, reaper.GetTrackName(tr))) or '?', np, np == 1 and '' or 's'))
-  end
-  local rv, tnum, _, fnum = reaper.GetFocusedFX2()
-  if rv and rv ~= 0 and rv & 2 == 0 then
-    local tr = tnum == 0 and reaper.GetMasterTrack(proj) or reaper.GetTrack(proj, tnum - 1)
-    if tr then
-      local _, fn = reaper.TrackFX_GetFXName(tr, fnum)
-      add('fx', 'FX  ' .. (fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')),
-        ('%s\non %s%s'):format(fn, tnum == 0 and 'MASTER' or ('#%d %s'):format(tnum, select(2, reaper.GetTrackName(tr))),
-          reaper.TrackFX_GetEnabled(tr, fnum) and '' or ' (bypassed)'))
-    end
-  end
-  return P
-end
-
-local function sel_tick(force)
-  local now = reaper.time_precise()
-  if not force and now - SEL.t < 0.25 then return end
-  SEL.t = now
-  local proj = reaper.EnumProjects(-1)
-  local g = sel_sigs(proj)
-  local changed = false
-  for _, k in ipairs(SEL_KINDS) do
-    if SEL.sig[k] == nil then SEL.at[k] = false; changed = true -- already like this when the panel opened
-    elseif SEL.sig[k] ~= g[k] then SEL.at[k] = now; changed = true end
-    SEL.sig[k] = g[k]
-  end
-  if changed or now - (SEL.pills_at or 0) > 2 then -- names can change without the selection changing
-    SEL.pills, SEL.pills_at = sel_pills(proj), now
-  end
-end
-
-local function age(k)
-  local t = SEL.at[k]
-  if not t then return 'before panel opened' end
-  local d = reaper.time_precise() - t
-  if d < 60 then return ('%ds ago'):format(math.floor(d)) end
-  if d < 3600 then return ('%d min ago'):format(math.floor(d / 60)) end
-  return ('%d h ago'):format(math.floor(d / 3600))
-end
-local function set_ago(k) return ' (set ' .. age(k) .. ')' end
-
-local function recency()
-  local live = {}
-  for _, k in ipairs(SEL_KINDS) do
-    if SEL.sig[k] and SEL.sig[k] ~= '' and not (k == 'cursor' and SEL.at[k] == false) then live[#live + 1] = k end
-  end
-  if #live < 2 then return nil end
-  table.sort(live, function(a, b) return (SEL.at[a] or -1) > (SEL.at[b] or -1) end)
-  local out = {}
-  for _, k in ipairs(live) do out[#out + 1] = SEL_LABEL[k] .. ' ' .. age(k) end
-  return 'newest first: ' .. table.concat(out, ' > ')
-end
-
--- markers, regions and notes inside a time range; tracks = nil means every track
-local function range_lines(proj, t0, t1, tracks, indent)
-  local L = {}
-  local mk, rg, more = {}, {}, 0
-  local _, nm, nr = reaper.CountProjectMarkers(proj)
-  for i = 0, (nm or 0) + (nr or 0) - 1 do
-    local _, isr, p0, p1, name, num = reaper.EnumProjectMarkers3(proj, i)
-    if isr then
-      if p0 < t1 and p1 > t0 then rg[#rg + 1] = ('"%s" %s–%s'):format(name, pos(p0), pos(p1)) end
-    elseif p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 then
-      if #mk < 16 then mk[#mk + 1] = ('%d "%s" @ %s'):format(num, name, pos(p0)) else more = more + 1 end
-    end
-  end
-  if more > 0 then mk[#mk + 1] = ('… +%d more'):format(more) end
-  if #mk > 0 then L[#L + 1] = indent .. 'markers: ' .. table.concat(mk, ', ') end
-  if #rg > 0 then L[#L + 1] = indent .. 'regions: ' .. table.concat(rg, ', ') end
-  if not tracks then
-    tracks = {}
-    for i = 0, reaper.CountTracks(proj) - 1 do tracks[#tracks + 1] = reaper.GetTrack(proj, i) end
-  end
-  local parts, extra = {}, 0
-  for _, tr in ipairs(tracks) do
-    local notes, lo, hi, audio = 0, 128, -1, 0
-    for i = 0, reaper.CountTrackMediaItems(tr) - 1 do
-      local m = reaper.GetTrackMediaItem(tr, i)
-      local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
-      local p1 = p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
-      local take = reaper.GetActiveTake(m)
-      if take and p0 < t1 and p1 > t0 and reaper.GetMediaItemInfo_Value(m, 'B_MUTE') == 0 then
-        if reaper.TakeIsMIDI(take) then
-          local a = reaper.MIDI_GetPPQPosFromProjTime(take, math.max(t0, p0))
-          local b = reaper.MIDI_GetPPQPosFromProjTime(take, math.min(t1, p1))
-          local _, nn = reaper.MIDI_CountEvts(take)
-          local k0, k1 = 0, nn -- notes are sorted by start: binary search for the first one at or after a
-          while k0 < k1 do
-            local mid = (k0 + k1) // 2
-            local _, _, _, sp = reaper.MIDI_GetNote(take, mid)
-            if sp < a then k0 = mid + 1 else k1 = mid end
-          end
-          for k = k0, nn - 1 do
-            local _, _, muted, sp, _, _, pitch = reaper.MIDI_GetNote(take, k)
-            if sp >= b then break end
-            if not muted and sp >= a then notes = notes + 1; lo = math.min(lo, pitch); hi = math.max(hi, pitch) end
-          end
-        else
-          audio = audio + 1
-        end
-      end
-    end
-    if notes > 0 or audio > 0 then
-      if #parts < 16 then
-        local _, tn = reaper.GetTrackName(tr)
-        local d = {}
-        if notes > 0 then d[#d + 1] = ('%d %s %s–%s'):format(notes, notes == 1 and 'note' or 'notes', note_name(lo), note_name(hi)) end
-        if audio > 0 then d[#d + 1] = 'audio' end
-        local muted = reaper.GetMediaTrackInfo_Value(tr, 'B_MUTE') == 1 and ', track muted' or ''
-        parts[#parts + 1] = ('#%d %s (%s%s)'):format(trnum(tr), tn, table.concat(d, ' + '), muted)
-      else
-        extra = extra + 1
-      end
-    end
-  end
-  if extra > 0 then parts[#parts + 1] = ('… +%d more tracks'):format(extra) end
-  L[#L + 1] = indent .. 'playing here: ' .. (#parts > 0 and table.concat(parts, ', ') or 'nothing')
-  return L
-end
-
--- razor edit = a rectangle (time range × tracks), each track can hold several ranges
-local function razor_ctx(proj)
-  local out = {}
-  for i = 0, reaper.CountTracks(proj) - 1 do
-    local tr = reaper.GetTrack(proj, i)
-    local _, s = reaper.GetSetMediaTrackInfo_String(tr, 'P_RAZOREDITS', '', false)
-    if s and s ~= '' then
-      local _, tn = reaper.GetTrackName(tr)
-      for a, b, g in s:gmatch('(%S+) (%S+) "([^"]*)"') do
-        out[#out + 1] = { tr = tr, t0 = tonumber(a), t1 = tonumber(b), env = g ~= '',
-          label = ('#%d %s %s–%s%s'):format(i + 1, tn, pos(tonumber(a)), pos(tonumber(b)), g ~= '' and ' (envelope lane)' or '') }
-      end
-    end
-  end
-  return out
-end
-
-local function fx_ctx(proj, full)
-  local rv, tnum, inum, fnum = reaper.GetFocusedFX2()
-  if not rv or rv == 0 then return nil end
-  local tr = tnum == 0 and reaper.GetMasterTrack(proj) or reaper.GetTrack(proj, tnum - 1)
-  if not tr then return nil end
-  local _, tname = reaper.GetTrackName(tr)
-  local where = tnum == 0 and 'MASTER' or ('#%d %s'):format(tnum, tname)
-  local name, nparams, pname, pval, enabled
-  if rv & 2 ~= 0 then
-    local item = reaper.GetTrackMediaItem(tr, inum)
-    local take = item and reaper.GetMediaItemTake(item, fnum >> 16)
-    if not take then return nil end
-    local fx = fnum & 0xFFFF
-    name = select(2, reaper.TakeFX_GetFXName(take, fx))
-    nparams = reaper.TakeFX_GetNumParams(take, fx)
-    pname = function(p) return select(2, reaper.TakeFX_GetParamName(take, fx, p)) end
-    pval = function(p) return select(2, reaper.TakeFX_GetFormattedParamValue(take, fx, p)) end
-    enabled = reaper.TakeFX_GetEnabled(take, fx)
-    where = where .. (', item %d take FX %d'):format(inum, fx)
-  else
-    name = select(2, reaper.TrackFX_GetFXName(tr, fnum))
-    nparams = reaper.TrackFX_GetNumParams(tr, fnum)
-    pname = function(p) return select(2, reaper.TrackFX_GetParamName(tr, fnum, p)) end
-    pval = function(p) return select(2, reaper.TrackFX_GetFormattedParamValue(tr, fnum, p)) end
-    enabled = reaper.TrackFX_GetEnabled(tr, fnum)
-    where = where .. ((fnum & 0x1000000 ~= 0) and (', input FX %d'):format(fnum & 0xFFFFFF) or (', FX %d'):format(fnum))
-  end
-  local r = { name = name, short = (name:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')), where = where,
-    enabled = enabled, focused = rv & 4 == 0, n = nparams, params = {} }
-  if full then
-    for p = 0, nparams - 1 do
-      if #r.params >= 48 then break end
-      local pn = pname(p)
-      if pn and pn ~= '' and pn ~= 'Bypass' and pn ~= 'Wet' and pn ~= 'Delta' then
-        r.params[#r.params + 1] = ('  p%d %s = %s'):format(p, pn, pval(p) or '')
-      end
-    end
-  end
-  return r
-end
-
--- full=false: cheap chip summary; full=true: the context block
-local function context(full)
-  local proj = reaper.EnumProjects(-1)
-  local name = reaper.GetProjectName(proj):gsub('%.[Rr][Pp][Pp]$', '')
-  if name == '' then name = '(unsaved)' end
-  local ps = reaper.GetPlayState()
-  local state = (ps & 4 ~= 0) and 'recording' or (ps & 1 ~= 0) and 'playing' or (ps & 2 ~= 0) and 'paused' or 'stopped'
-  local cur = (ps & 1 ~= 0) and reaper.GetPlayPosition() or reaper.GetCursorPosition()
-  local bpm = math.floor(reaper.Master_GetTempo() * 100 + 0.5) / 100
-  local num, den = reaper.TimeMap_GetTimeSigAtTime(proj, cur)
-  local L = {
-    ('project: %s'):format(name),
-    ('tempo: %g BPM %d/%d'):format(bpm, num, den),
-    ('cursor: %s (%s)'):format(pos(cur), state),
-  }
-  local chip = { name, ('%g BPM'):format(bpm), pos(cur) }
-
-
-  if full then
-    sel_tick(true)
-    local rc = recency()
-    if rc then L[#L + 1] = 'selection recency: ' .. rc end
-  end
-
-  local mk = marker_ctx(proj, cur)
-  if mk.region then L[#L + 1] = 'region at cursor: ' .. mk.region; chip[#chip + 1] = mk.region_name end
-  if mk.markers then L[#L + 1] = 'markers at cursor: ' .. mk.markers end
-
-  local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
-  if e > s then
-    chip[#chip + 1] = 'time sel'
-    if full then
-      L[#L + 1] = ('time selection (all tracks): %s – %s%s'):format(pos(s), pos(e), set_ago('time'))
-      for _, x in ipairs(range_lines(proj, s, e, nil, '  ')) do L[#L + 1] = x end
-    else
-      L[#L + 1] = ('time selection: %s – %s'):format(pos(s), pos(e))
-    end
-  end
-
-  local rz = razor_ctx(proj)
-  if #rz > 0 then
-    chip[#chip + 1] = 'razor'
-    -- ranges with the same start/end on several tracks are one rectangle
-    local areas, by = {}, {}
-    for _, r in ipairs(rz) do
-      local key = ('%.6f:%.6f'):format(r.t0, r.t1)
-      local a = by[key]
-      if not a then a = { t0 = r.t0, t1 = r.t1, tracks = {}, names = {} }; by[key] = a; areas[#areas + 1] = a end
-      if not r.env and a.tracks[#a.tracks] ~= r.tr then a.tracks[#a.tracks + 1] = r.tr end
-      local _, tn = reaper.GetTrackName(r.tr)
-      local nm_ = ('#%d %s%s'):format(trnum(r.tr), tn, r.env and ' (envelope lane)' or '')
-      if a.names[#a.names] ~= nm_ then a.names[#a.names + 1] = nm_ end
-    end
-    if full then
-      for n, a in ipairs(areas) do
-        if n > 8 then L[#L + 1] = ('  … +%d more razor areas'):format(#areas - 8); break end
-        L[#L + 1] = ('razor area: %s – %s on %s%s'):format(pos(a.t0), pos(a.t1), table.concat(a.names, ', '), set_ago('razor'))
-        if #a.tracks > 0 then
-          for _, x in ipairs(range_lines(proj, a.t0, a.t1, a.tracks, '  ')) do L[#L + 1] = x end
-        end
-      end
-    end
-  end
-
-  local tr = {}
-  for i = 0, reaper.CountSelectedTracks(proj) - 1 do
-    local t = reaper.GetSelectedTrack(proj, i)
-    local _, tn = reaper.GetTrackName(t)
-    tr[#tr + 1] = { ('#%d %s'):format(trnum(t), tn), tn }
-  end
-  if #tr > 0 then
-    local names = {}
-    for _, x in ipairs(tr) do names[#names + 1] = x[1] end
-    L[#L + 1] = 'selected tracks: ' .. table.concat(names, ', ') .. (full and set_ago('tracks') or '')
-    chip[#chip + 1] = #tr == 1 and tr[1][2] or (#tr .. ' tracks')
-  end
-
-  local n = reaper.CountSelectedMediaItems(proj)
-  if n > 0 then
-    if full then
-      local it = {}
-      for i = 0, math.min(n, 8) - 1 do
-        local m = reaper.GetSelectedMediaItem(proj, i)
-        local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
-        local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
-        local len = reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
-        it[#it + 1] = ('%s @ %s–%s'):format(tn, pos(p0), pos(p0 + len))
-      end
-      if n > 8 then it[#it + 1] = ('… +%d more'):format(n - 8) end
-      L[#L + 1] = 'selected items: ' .. table.concat(it, '; ') .. set_ago('items')
-    end
-    chip[#chip + 1] = n .. (n == 1 and ' item' or ' items')
-  end
-
-  local md = midi_ctx(proj, full)
-  if md then
-    if md.sel > 0 then
-      chip[#chip + 1] = md.sel .. (md.sel == 1 and ' note' or ' notes')
-      if full then
-        L[#L + 1] = ('MIDI editor: %s, item @ %s, take "%s" — %d of %d notes selected%s%s:'):format(
-          md.track, md.item, md.take, md.sel, md.total, md.sel > #md.list and (' (first ' .. #md.list .. ' listed)') or '',
-          set_ago('notes'))
-        for _, x in ipairs(md.list) do L[#L + 1] = x end
-      end
-    elseif full then
-      L[#L + 1] = ('MIDI editor open: %s, item @ %s, take "%s", %d notes, none selected'):format(md.track, md.item, md.take, md.total)
-    end
-    if full and md.cc_sel > 0 then
-      do
-        L[#L + 1] = ('MIDI CC: %d of %d events selected%s:'):format(md.cc_sel, md.cc_total,
-          md.cc_sel > #md.cc_list and (' (first ' .. #md.cc_list .. ' listed)') or '')
-        for _, x in ipairs(md.cc_list) do L[#L + 1] = x end
-      end
-    end
-  end
-
-  if full then
-    local ev = envelope_ctx(proj)
-    if ev then
-      L[#L + 1] = ev.head:gsub(':$', '') .. set_ago('env') .. (ev.head:find(':$') and ':' or '')
-      for _, x in ipairs(ev.list) do L[#L + 1] = x end
-    end
-  end
-
-  local fx = fx_ctx(proj, full)
-  if fx then
-    chip[#chip + 1] = 'FX: ' .. fx.short
-    if full then
-      L[#L + 1] = ('%s FX: %s on %s (%s) — %d params%s%s:'):format(fx.focused and 'focused' or 'open (last focused)',
-        fx.name, fx.where, fx.enabled and 'enabled' or 'bypassed', fx.n,
-        fx.n > #fx.params and (', first ' .. #fx.params .. ' shown') or '', set_ago('fx'))
-      for _, x in ipairs(fx.params) do L[#L + 1] = x end
-    end
-  end
-  if full and studio then studio.context_lines(L) end
-  return table.concat(L, '\n'), table.concat(chip, ' · ')
-end
-
-local chip_text
-do
-  local chip_cache, chip_at = '', 0
-  function chip_text()
-    local now = reaper.time_precise()
-    if now - chip_at > 0.25 then
-      chip_at = now
-      local _, c = context(false)
-      chip_cache = c
-    end
-    return chip_cache
-  end
-end
-
-local CTX_OPEN = '[REAPER context — auto-attached by the Hibiki panel in REAPER; #N = REAPER track number, MCP index = N-1]'
-local CTX_CLOSE = '[/REAPER context]'
--- first line of the block; CTX_OPEN itself stays fixed so older messages still fold
-local CTX_NOTE = 'note: REAPER keeps every selection until it is changed, so stale ones linger; "set … ago" says what the user touched last. Read the request first, then the newest selection.'
-
-local function split_context(text)
-  local a, b = text:find(CTX_OPEN, 1, true)
-  if a == 1 then
-    local c, d = text:find(CTX_CLOSE, b, true)
-    if c then return (text:sub(d + 1):gsub('^%s+', '')), true, text:sub(b + 1, c - 1) end
-  end
-  return text, false
-end
+---------------------------------------------------------------- REAPER context (panel/context.lua)
+local CX = load_part('context.lua', { studio = function() return studio end })
 
 ---------------------------------------------------------------- actions
 local ime_cb -- created with the ImGui context below; send() clears the input through it
@@ -1362,21 +767,19 @@ local function send()
   local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
   if text == '' and #S.files == 0 then return end
   if S.uploading then return end
-  -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
-  -- Enter (or key repeat) re-sent it; the composer clears ImGui's buffer next frame (S.clear_input) and exact
-  -- repeats are dropped here
-  S.clear_input = true
+  -- the emptied S.input reaches the still-active field next frame (the composer pushes it in); exact repeats of a
+  -- quick second Enter or key repeat are dropped here
   local now = reaper.time_precise()
   if #S.files == 0 and text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
   if studio and #S.files == 0 and studio.command(text) then S.input = ''; return end
   S.last_sent, S.last_sent_at = text, now
   local payload = text
   if S.ctx_level > 0 then
-    local ctx_text = context(true)
-    payload = CTX_OPEN .. '\n' .. CTX_NOTE .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
+    local ctx_text = CX.context(true)
+    payload = CX.CTX_OPEN .. '\n' .. CX.CTX_NOTE .. '\n' .. ctx_text .. '\n' .. CX.CTX_CLOSE .. '\n\n' .. text
   elseif studio and studio.take_ears then -- Context off: an Ears summary still goes with the message its files go with
     local e = studio.take_ears()
-    if e then payload = CTX_OPEN .. '\n' .. e .. '\n' .. CTX_CLOSE .. '\n\n' .. text end
+    if e then payload = CX.CTX_OPEN .. '\n' .. e .. '\n' .. CX.CTX_CLOSE .. '\n\n' .. text end
   end
   if #S.files == 0 then return deliver(payload, text, text) end
   -- upload the attachments first, then send the message with Gamut's "[Attached files:]" block
@@ -1398,8 +801,14 @@ local function send()
         S.files, S.input = files, text
         return
       end
-      local lines = {}
-      for m = 1, #files do lines[#lines + 1] = '- ' .. paths[m] end
+      local lines, host = {}, {}
+      for m = 1, #files do
+        lines[#lines + 1] = '- ' .. paths[m]
+        if paths[m] ~= files[m].path then host[#host + 1] = files[m].path end
+      end
+      -- Gamut stores uploads in the agent's container; REAPER (item import) needs the file where it already is.
+      -- One line that doesn't start with "- " so it isn't read as another attachment.
+      if #host > 0 then lines[#lines + 1] = '(on the REAPER host: ' .. table.concat(host, '; ') .. ')' end
       deliver(payload .. (payload ~= '' and '\n\n' or '') .. '[Attached files:]\n' .. table.concat(lines, '\n'),
         text ~= '' and text or files[1].name, text, files)
     end)
@@ -1988,26 +1397,23 @@ ImGui.SetConfigVar(ctx, ImGui.ConfigVar_InputTrickleEventQueue, 0)
 -- ReaImGui (cocoa_inputview.mm keyDown) hands every key to the IME *and* to ImGui, so while a pinyin
 -- composition is open Backspace/arrows/Esc also edit the field and Enter also sends. We infer the composition
 -- (letter keys that produced no characters) and this callback undoes ImGui's side of those keys.
+-- It also keeps the field's text in #prev: ReaImGui hands the buffer back to Lua only when InputTextMultiline
+-- returns true, which with EnterReturnsTrue is Enter alone, so the composer reads what was typed from here.
+-- restore puts #prev back (also how Lua-side changes reach the active field). ReaImGui reloads #Buf and CursorPos
+-- after each InputTextCallback_* edit; an empty InsertChars is skipped (it would take front() of an empty string).
 ime_cb = ImGui.CreateFunctionFromEEL([[
-clear ? (
+restore ? (
   InputTextCallback_DeleteChars(0, strlen(#Buf));
-  CursorPos = 0; SelectionStart = 0; SelectionEnd = 0;
-  strcpy(#prev, ""); prev_cursor = 0;
-  clear = 0; restore = 0; strip_nl = 0;
-) : restore ? (
-  InputTextCallback_DeleteChars(0, strlen(#Buf));
-  InputTextCallback_InsertChars(0, #prev);
+  strlen(#prev) ? InputTextCallback_InsertChars(0, #prev);
   CursorPos = prev_cursor; SelectionStart = prev_cursor; SelectionEnd = prev_cursor;
   restore = 0;
 ) : (
-  strip_nl && CursorPos > 0 && str_getchar(#Buf, CursorPos - 1) == 10 ? (
-    InputTextCallback_DeleteChars(CursorPos - 1, 1);
-    strcpy(#prev, #Buf); str_delsub(#prev, CursorPos - 1, 1);
-    CursorPos -= 1; SelectionStart = CursorPos; SelectionEnd = CursorPos;
-  ) : strcpy(#prev, #Buf);
+  strip_nl && CursorPos > 0 && str_getchar(#Buf, CursorPos - 1) == 10 ? InputTextCallback_DeleteChars(CursorPos - 1, 1);
   strip_nl = 0;
+  strcpy(#prev, #Buf);
   prev_cursor = CursorPos;
 );
+ran = 1;
 ]])
 ImGui.Attach(ctx, ime_cb)
 local FONT_SIZE = 14
@@ -2137,438 +1543,9 @@ local VARS = {
   { ImGui.StyleVar_ItemSpacing, 8, 6 }, { ImGui.StyleVar_WindowBorderSize, 0 },
 }
 
----------------------------------------------------------------- markdown
-local wcache, wcache_n = {}, 0
-local function tw(font, size, s)
-  local fc = wcache[font]
-  if not fc then fc = {}; wcache[font] = fc end
-  local sc = fc[size]
-  if not sc then sc = {}; fc[size] = sc end
-  local w = sc[s]
-  if not w then
-    ImGui.PushFont(ctx, font, size)
-    w = ImGui.CalcTextSize(ctx, s)
-    ImGui.PopFont(ctx)
-    sc[s] = w
-    wcache_n = wcache_n + 1
-    if wcache_n > 30000 then wcache, wcache_n = {}, 0 end
-  end
-  return w
-end
-
-local function parse_inline(s)
-  local runs, buf = {}, {}
-  local bold = false
-  local function flush()
-    if #buf > 0 then runs[#runs + 1] = { text = table.concat(buf), bold = bold }; buf = {} end
-  end
-  local i, n = 1, #s
-  while i <= n do
-    local c = s:sub(i, i)
-    local handled = false
-    if c == '`' then
-      local j = s:find('`', i + 1, true)
-      if j then flush(); runs[#runs + 1] = { text = s:sub(i + 1, j - 1), code = true }; i = j + 1; handled = true end
-    elseif (c == '*' or c == '_') and s:sub(i + 1, i + 1) == c then
-      flush(); bold = not bold; i = i + 2; handled = true
-    elseif c == '[' then
-      local t, u, e = s:match('^%[([^%]]+)%]%(([^%)%s]+)%)()', i)
-      if t then flush(); runs[#runs + 1] = { text = t, link = u }; i = e; handled = true end
-    elseif c == '*' then
-      local j = s:find('*', i + 1, true)
-      if j and j > i + 1 and not s:sub(i + 1, i + 1):match('%s') then
-        flush(); runs[#runs + 1] = { text = s:sub(i + 1, j - 1), italic = true, bold = bold }; i = j + 1; handled = true
-      end
-    end
-    if not handled then buf[#buf + 1] = c; i = i + 1 end
-  end
-  flush()
-  return runs
-end
-
-local function tokens(s)
-  local out, i, n = {}, 1, #s
-  while i <= n do
-    local b = s:byte(i)
-    if b == 10 then
-      out[#out + 1] = '\n'; i = i + 1
-    elseif b < 0x80 then
-      local tok = s:match('^[^ \n\128-\255]+ *', i) or s:match('^ +', i)
-      out[#out + 1] = tok; i = i + #tok
-    else
-      local len = b >= 0xF0 and 4 or b >= 0xE0 and 3 or b >= 0xC0 and 2 or 1
-      out[#out + 1] = s:sub(i, i + len - 1); i = i + len
-    end
-  end
-  return out
-end
-
--- ops: {'t', x, y, font, size, col, text} | {'r', x1, y1, x2, y2, col, rounding} | {'l', x1, y1, x2, y2, col, thick}
-local function layout_inline(ops, runs, x0, y, maxw, size, base_col, mono)
-  local lh = math.floor(size * 1.5 + 0.5)
-  local dy = math.floor((lh - size) / 2)
-  local x, has = x0, false
-  local nl = true -- the first op of a block, and the first after a hard newline, starts a source line
-  local function put(op)
-    if op[1] == 't' and nl then op.nl, nl = true, false end
-    ops[#ops + 1] = op
-  end
-  for _, r in ipairs(runs) do
-    local font = (mono or r.code) and F.mono or (r.bold and F.bold or F.reg)
-    local col = r.link and C.accent or (r.italic and C.muted) or base_col
-    for _, tok in ipairs(tokens(r.text)) do
-      if tok == '\n' then
-        x, y, has, nl = x0, y + lh, false, true
-      else
-        local f
-        if font == F.mono then f = tok:byte(1) >= 0x80 and F.reg or F.mono
-        elseif tok:byte(1) >= 0xE2 then f = font
-        else f = font == F.bold and F.ui_bold or F.ui end
-        local w = tw(f, size, tok)
-        if x + w > x0 + maxw and has then
-          x, y, has = x0, y + lh, false
-          if not mono then tok = tok:gsub('^ +', ''); w = tw(f, size, tok) end
-        end
-        if tok ~= '' then
-          if w > maxw then
-            for ch in tok:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
-              local cw = tw(f, size, ch)
-              if x + cw > x0 + maxw and has then x, y = x0, y + lh end
-              put({ 't', x, y + dy, f, size, col, ch })
-              x, has = x + cw, true
-            end
-          else
-            if r.code and not mono then ops[#ops + 1] = { 'r', x, y + 1, x + w, y + lh - 1, C.codebg, 2 } end
-            put({ 't', x, y + dy, f, size, col, tok })
-            if r.link then ops[#ops + 1] = { 'l', x, y + dy + size + 1, x + w, y + dy + size + 1, alpha(C.accent, 0x88), 1 } end
-            x, has = x + w, true
-          end
-        end
-      end
-    end
-  end
-  return y + lh
-end
-
-local function parse_md(text)
-  local blocks, lines = {}, {}
-  for l in (text .. '\n'):gmatch('(.-)\r?\n') do lines[#lines + 1] = l end
-  local function cells(row)
-    row = row:gsub('^%s*|', ''):gsub('|%s*$', '')
-    local c = {}
-    for cell in (row .. '|'):gmatch('(.-)|') do c[#c + 1] = parse_inline((cell:gsub('^%s+', ''):gsub('%s+$', ''))) end
-    return c
-  end
-  local i = 1
-  while i <= #lines do
-    local l = lines[i]
-    if l:match('^%s*```') then
-      local buf = {}
-      i = i + 1
-      while i <= #lines and not lines[i]:match('^%s*```%s*$') do buf[#buf + 1] = lines[i]; i = i + 1 end
-      blocks[#blocks + 1] = { t = 'code', text = table.concat(buf, '\n') }
-      i = i + 1
-    elseif l:match('^%s*$') then
-      blocks[#blocks + 1] = { t = 'blank' }; i = i + 1
-    elseif l:match('^#+%s') then
-      local h, rest = l:match('^(#+)%s+(.*)$')
-      blocks[#blocks + 1] = { t = 'h', level = #h, runs = parse_inline(rest) }; i = i + 1
-    elseif l:match('^%s*[-*_][-*_ ]*$') and select(2, l:gsub('[-*_]', '')) >= 3 then
-      blocks[#blocks + 1] = { t = 'hr' }; i = i + 1
-    elseif l:match('^%s*|') and lines[i + 1] and lines[i + 1]:match('^%s*|?%s*:?%-%-') then
-      local head = cells(l)
-      i = i + 2
-      local rows = {}
-      while i <= #lines and lines[i]:match('^%s*|') do rows[#rows + 1] = cells(lines[i]); i = i + 1 end
-      blocks[#blocks + 1] = { t = 'table', head = head, rows = rows }
-    elseif l:match('^%s*>') then
-      blocks[#blocks + 1] = { t = 'quote', runs = parse_inline((l:gsub('^%s*>%s?', ''))) }; i = i + 1
-    elseif l:match('^%s*[-*+]%s') then
-      local ind, rest = l:match('^(%s*)[-*+]%s+(.*)$')
-      blocks[#blocks + 1] = { t = 'li', level = #ind // 2, bullet = '•', runs = parse_inline(rest) }; i = i + 1
-    elseif l:match('^%s*%d+[.)]%s') then
-      local ind, num, rest = l:match('^(%s*)(%d+)[.)]%s+(.*)$')
-      blocks[#blocks + 1] = { t = 'li', level = #ind // 2, bullet = num .. '.', runs = parse_inline(rest) }; i = i + 1
-    else
-      blocks[#blocks + 1] = { t = 'p', runs = parse_inline(l) }; i = i + 1
-    end
-  end
-  return blocks
-end
-
-local function layout_table(ops, b, y, maxw, size)
-  local ncol = #b.head
-  for _, r in ipairs(b.rows) do ncol = math.max(ncol, #r) end
-  local pad = 6
-  local function natural(runs, bold)
-    local w = 0
-    for _, r in ipairs(runs) do
-      local f = r.code and F.mono or ((bold or r.bold) and F.bold or F.reg)
-      w = w + tw(f, size, (r.text:gsub('\n', ' ')))
-    end
-    return w
-  end
-  local nat = {}
-  for c = 1, ncol do nat[c] = 24 end
-  for c, cell in ipairs(b.head) do nat[c] = math.max(nat[c], natural(cell, true) + 2 * pad) end
-  for _, row in ipairs(b.rows) do
-    for c, cell in ipairs(row) do if c <= ncol then nat[c] = math.max(nat[c], natural(cell) + 2 * pad) end end
-  end
-  local total = 0
-  for c = 1, ncol do total = total + nat[c] end
-  local widths, sum = {}, 0
-  for c = 1, ncol do
-    widths[c] = total <= maxw and nat[c] or math.max(36, math.floor(nat[c] * maxw / total))
-    sum = sum + widths[c]
-  end
-  local function row(cells, yy, header)
-    local sub, h, x = {}, 0, 0
-    for c = 1, ncol do
-      local runs = cells[c] or {}
-      if header then for _, r in ipairs(runs) do r.bold = true end end
-      local yb = layout_inline(sub, runs, x + pad, yy + 3, widths[c] - 2 * pad, size, C.body)
-      h = math.max(h, yb - yy + 3)
-      x = x + widths[c]
-    end
-    if header then ops[#ops + 1] = { 'r', 0, yy, sum, yy + h, C.panel, 0 } end
-    for _, o in ipairs(sub) do ops[#ops + 1] = o end
-    ops[#ops + 1] = { 'l', 0, yy + h, sum, yy + h, C.rule, 1 }
-    return yy + h
-  end
-  local y0 = y
-  ops[#ops + 1] = { 'l', 0, y, sum, y, C.rule, 1 }
-  y = row(b.head, y, true)
-  for _, r in ipairs(b.rows) do y = row(r, y, false) end
-  local x = 0
-  for c = 0, ncol do
-    ops[#ops + 1] = { 'l', x, y0, x, y, C.rule, 1 }
-    if c < ncol then x = x + widths[c + 1] end
-  end
-  return y + 6
-end
-
-local function layout_md(text, maxw, size, y0)
-  local ops, y = {}, y0 or 0
-  local lh = math.floor(size * 1.5 + 0.5)
-  for _, b in ipairs(parse_md(text)) do
-    if b.t == 'blank' then
-      y = y + math.floor(lh * 0.45)
-    elseif b.t == 'p' then
-      y = layout_inline(ops, b.runs, 0, y, maxw, size, C.body)
-    elseif b.t == 'h' then
-      local hs = b.level == 1 and size + 5 or b.level == 2 and size + 3 or size + 1
-      if y > 0 then y = y + math.floor(lh * 0.4) end
-      for _, r in ipairs(b.runs) do if not r.code then r.bold = true end end
-      y = layout_inline(ops, b.runs, 0, y, maxw, hs, C.text)
-      if b.level <= 2 then ops[#ops + 1] = { 'l', 0, y + 1, maxw, y + 1, C.rule, 1 }; y = y + 5 end
-    elseif b.t == 'li' then
-      local ind = 2 + b.level * 16
-      local bw = math.max(tw(F.reg, size, b.bullet) + 6, 14)
-      ops[#ops + 1] = { 't', ind, y + math.floor((lh - size) / 2), F.reg, size, C.muted, b.bullet, nl = true }
-      y = layout_inline(ops, b.runs, ind + bw, y, maxw - ind - bw, size, C.body)
-    elseif b.t == 'quote' then
-      local y0 = y
-      y = layout_inline(ops, b.runs, 12, y, maxw - 12, size, C.muted)
-      ops[#ops + 1] = { 'r', 0, y0 + 2, 3, y - 2, alpha(C.accent, 0x99), 1 }
-    elseif b.t == 'hr' then
-      y = y + 6; ops[#ops + 1] = { 'l', 0, y, maxw, y, C.rule, 1 }; y = y + 7
-    elseif b.t == 'code' then
-      local pad, y0, sub = 8, y, {}
-      y = layout_inline(sub, { { text = b.text } }, pad, y + pad, maxw - 2 * pad, size - 1, C.text, true)
-      ops[#ops + 1] = { 'r', 0, y0, maxw, y + pad, C.code, 6 }
-      for _, o in ipairs(sub) do ops[#ops + 1] = o end
-      y = y + pad + 6
-    elseif b.t == 'table' then
-      y = layout_table(ops, b, y, maxw, size)
-    end
-  end
-  return ops, y
-end
-
--- Text selection. Messages are drawn from laid-out ops, so ImGui's own selection doesn't apply: hit-test the
--- text ops, keep {op index, byte offset} for both ends, highlight, and copy with Cmd+C.
-local function op_line(o)
-  local lh = math.floor(o[5] * 1.5 + 0.5)
-  local top = o[3] - math.floor((lh - o[5]) / 2)
-  return top, top + lh
-end
-local function op_stops(o) -- {byte offset, x} at every character boundary, cached on the op
-  if not o.stops then
-    local st, x = { { 0, o[2] } }, o[2]
-    for pos, ch in o[7]:gmatch('()([%z\1-\127\194-\244][\128-\191]*)') do
-      x = x + tw(o[4], o[5], ch)
-      st[#st + 1] = { pos + #ch - 1, x }
-    end
-    o.stops = st
-  end
-  return o.stops
-end
-local function stop_x(o, off)
-  for _, st in ipairs(op_stops(o)) do if st[1] >= off then return st[2] end end
-  return o[2]
-end
-local function hit(ops, lx, ly)
-  local best, bd
-  for i, o in ipairs(ops) do
-    if o[1] == 't' then
-      local top, bot = op_line(o)
-      local st = op_stops(o)
-      local right = st[#st][2]
-      local dv = ly < top and top - ly or (ly > bot and ly - bot or 0)
-      local dh = lx < o[2] and o[2] - lx or (lx > right and lx - right or 0)
-      local d = dv * 10000 + dh
-      if not bd or d < bd then best, bd = i, d end
-    end
-  end
-  if not best then return nil end
-  local off, dx = 0, math.huge
-  for _, st in ipairs(op_stops(ops[best])) do
-    if math.abs(st[2] - lx) < dx then off, dx = st[1], math.abs(st[2] - lx) end
-  end
-  return { i = best, off = off }
-end
-local function sel_range(sel)
-  local a, b = sel.a, sel.b
-  if b.i < a.i or (b.i == a.i and b.off < a.off) then a, b = b, a end
-  return a, b
-end
-local function selected_text(sel)
-  local a, b = sel_range(sel)
-  local out, prev = {}, nil
-  for i = a.i, b.i do
-    local o = sel.L.ops[i]
-    if o[1] == 't' then
-      local piece = o[7]:sub((i == a.i and a.off or 0) + 1, i == b.i and b.off or #o[7])
-      if prev then
-        if o[3] > prev[3] + 1 then
-          if o.nl then out[#out + 1] = '\n' end -- a wrapped line continues the same source line
-        elseif o[2] > op_stops(prev)[#op_stops(prev)][2] + 2 and not (out[#out] or ''):match(' $') then
-          out[#out + 1] = ' '
-        end
-      end
-      out[#out + 1] = piece
-      prev = o
-    end
-  end
-  return table.concat(out)
-end
-
-local function draw_ops(L, w)
-  local ops, h = L.ops, L.h
-  local x0, y0 = ImGui.GetCursorScreenPos(ctx)
-  local _, wy = ImGui.GetWindowPos(ctx)
-  local _, wh = ImGui.GetWindowSize(ctx)
-  if y0 + h >= wy and y0 <= wy + wh then
-    local dl = ImGui.GetWindowDrawList(ctx)
-    local top, bot = wy - y0 - 40, wy + wh - y0
-    local sel = S.sel and S.sel.L == L and S.sel
-    local sa, sb
-    if sel then sa, sb = sel_range(sel) end
-    for i, o in ipairs(ops) do
-      if sel and o[1] == 't' and i >= sa.i and i <= sb.i and o[3] > top and o[3] < bot then
-        local x1 = i == sa.i and stop_x(o, sa.off) or o[2]
-        local x2 = i == sb.i and stop_x(o, sb.off) or op_stops(o)[#op_stops(o)][2]
-        if x2 > x1 then
-          local lt, lb = op_line(o)
-          ImGui.DrawList_AddRectFilled(dl, x0 + x1, y0 + lt, x0 + x2, y0 + lb, C.selection)
-        end
-      end
-    end
-    S.n_ops = (S.n_ops or 0) + #ops
-    for _, o in ipairs(ops) do
-      local k = o[1]
-      if k == 't' then
-        if o[3] > top and o[3] < bot then ImGui.DrawList_AddTextEx(dl, o[4], o[5], x0 + o[2], y0 + o[3], o[6], o[7]) end
-      elseif o[5] > top and o[3] < bot then
-        if k == 'r' then ImGui.DrawList_AddRectFilled(dl, x0 + o[2], y0 + o[3], x0 + o[4], y0 + o[5], o[6], o[7])
-        else ImGui.DrawList_AddLine(dl, x0 + o[2], y0 + o[3], x0 + o[4], y0 + o[5], o[6], o[7]) end
-      end
-    end
-  end
-  ImGui.Dummy(ctx, w, math.max(1, h))
-  local hovered = ImGui.IsItemHovered(ctx)
-  if hovered then ImGui.SetMouseCursor(ctx, ImGui.MouseCursor_TextInput) end
-  local mx, my = ImGui.GetMousePos(ctx)
-  if hovered and ImGui.IsMouseClicked(ctx, 0) then
-    S.sel_clicked = true
-    local p = hit(ops, mx - x0, my - y0)
-    if p and ImGui.IsMouseDoubleClicked(ctx, 0) then -- whole word (one op)
-      S.sel = { L = L, a = { i = p.i, off = 0 }, b = { i = p.i, off = #ops[p.i][7] } }
-    else
-      S.sel = p and { L = L, a = p, b = p, drag = true } or nil
-    end
-  elseif S.sel and S.sel.L == L and S.sel.drag then
-    if ImGui.IsMouseDown(ctx, 0) then
-      S.sel.b = hit(ops, mx - x0, my - y0) or S.sel.b
-    else
-      S.sel.drag = false
-    end
-  end
-end
-
--- Incremental layout for a growing (streamed) reply. Blocks never span a complete blank line outside a ``` fence,
--- so the text splits there into a prefix whose ops are kept and a tail that is laid out again, starting at the
--- prefix's height. md_cut returns the last such split (the \n before that blank line) after byte `from`.
-local md_layout
-do
-local function md_cut(text, from)
-  local fence, best, p = false, nil, from + 1
-  while true do
-    local e = text:find('\n', p, true)
-    if not e then break end -- the last line may still grow: never split on it
-    local line = text:sub(p, e - 1)
-    if fence then
-      if line:match('^%s*```%s*$') then fence = false end
-    elseif line:match('^%s*```') then fence = true
-    elseif p - 1 > from and line:match('^%s*$') then best = p - 1 end
-    p = e + 1
-  end
-  return best
-end
-function md_layout(old, text, w)
-  local cut, pre_ops, pre_h, pre = 0, {}, 0, nil
-  if old and old.w == w and old.pal == pal_ver and old.cut > 0 and text:sub(1, old.cut) == old.pre then
-    cut, pre_ops, pre_h, pre = old.cut, old.pre_ops, old.pre_h, old.pre
-  end
-  local nc = md_cut(text, cut)
-  if nc then
-    local more, h = layout_md(text:sub(cut + 1, nc - 1), w, FONT_SIZE, pre_h)
-    table.move(more, 1, #more, #pre_ops + 1, pre_ops)
-    cut, pre_h, pre = nc, h, text:sub(1, nc)
-  end
-  local ops = table.move(pre_ops, 1, #pre_ops, 1, {})
-  local tail, h = layout_md(cut > 0 and text:sub(cut + 1) or text, w, FONT_SIZE, pre_h)
-  table.move(tail, 1, #tail, #ops + 1, ops)
-  return { w = w, text = text, pal = pal_ver, ops = ops, h = h, cut = cut, pre = pre, pre_ops = pre_ops, pre_h = pre_h }
-end
-end
-
-local function md(holder, text)
-  local w = math.floor(ImGui.GetContentRegionAvail(ctx))
-  local L = holder._md
-  if not L or L.w ~= w or L.text ~= text or L.pal ~= pal_ver then
-    S.n_lay = (S.n_lay or 0) + 1
-    L = md_layout(L, text, w)
-    holder._md = L
-  end
-  draw_ops(L, w)
-  if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
-end
-
-local function bubble(holder, text)
-  local w = math.floor(ImGui.GetContentRegionAvail(ctx))
-  local L = holder._bubble
-  if not L or L.w ~= w or L.text ~= text or L.pal ~= pal_ver then
-    local pad, sub = 8, {}
-    local y = layout_inline(sub, { { text = text } }, pad, pad, w - 2 * pad, FONT_SIZE, C.field_text)
-    local ops = { { 'r', 0, 0, w, y + pad, C.user, RND_STRIP } }
-    for _, o in ipairs(sub) do ops[#ops + 1] = o end
-    L = { w = w, text = text, pal = pal_ver, ops = ops, h = y + pad }
-    holder._bubble = L
-  end
-  draw_ops(L, w)
-  if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
-end
+---------------------------------------------------------------- markdown (panel/markdown.lua)
+local MD = load_part('markdown.lua', { ImGui = ImGui, ctx = ctx, S = S, C = C, F = F, FONT_SIZE = FONT_SIZE,
+  RND_STRIP = RND_STRIP, alpha = alpha, pal_ver = function() return pal_ver end })
 
 ---------------------------------------------------------------- UI
 -- attachments waiting in the composer (one table: the main chunk is at Lua's 200-local limit)
@@ -3333,8 +2310,8 @@ local function cfg_window()
     local KIND = { razor = 'Razor area', time = 'Time selection', tracks = 'Tracks', items = 'Items',
       notes = 'MIDI notes', env = 'Envelope', fx = 'FX window' }
     local P = {}
-    for _, p_ in ipairs(SEL.pills or {}) do P[#P + 1] = p_ end
-    table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
+    for _, p_ in ipairs(CX.SEL.pills or {}) do P[#P + 1] = p_ end
+    table.sort(P, function(a, b) return (CX.SEL.at[a.k] or -1) > (CX.SEL.at[b.k] or -1) end)
     if #P == 0 then ImGui.TextDisabled(ctx, 'Nothing selected') end
     for n, p_ in ipairs(P) do
       if n > 4 then break end
@@ -3427,19 +2404,19 @@ end
 -- row above the input: what is selected in REAPER right now, one pill per kind, newest first;
 -- the newest is outlined in accent, ones older than 2 min (or from before the panel opened) are greyed
 local SEL_STALE = 120
-local function sel_row_visible() return S.ctx_level > 0 and SEL.pills and #SEL.pills > 0 end
+local function sel_row_visible() return S.ctx_level > 0 and CX.SEL.pills and #CX.SEL.pills > 0 end
 local function sel_row()
   if not sel_row_visible() then return end
   local P = {}
-  for _, p in ipairs(SEL.pills) do P[#P + 1] = p end
-  table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
+  for _, p in ipairs(CX.SEL.pills) do P[#P + 1] = p end
+  table.sort(P, function(a, b) return (CX.SEL.at[a.k] or -1) > (CX.SEL.at[b.k] or -1) end)
   local now = reaper.time_precise()
   local dl = ImGui.GetWindowDrawList(ctx)
   local h = ImGui.GetFrameHeight(ctx) - 2
   local avail = ImGui.GetContentRegionAvail(ctx)
   local used = 0
   for n, p in ipairs(P) do
-    local t = SEL.at[p.k]
+    local t = CX.SEL.at[p.k]
     local d = t and (now - t) or nil
     local kind, value = p.label:match('^(%S+)  (.*)$')
     kind, value = kind or p.label, value or ''
@@ -3490,7 +2467,7 @@ local function context_chip()
     reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
   end
   if ImGui.IsItemHovered(ctx) then
-    show_tip(on and ('Sent with each message:\n' .. chip_text():gsub(' · ', '\n')) or 'Off')
+    show_tip(on and ('Sent with each message:\n' .. CX.chip_text():gsub(' · ', '\n')) or 'Off')
   end
 end
 
@@ -3813,7 +2790,7 @@ do
   do
   local function user_msg(m, id)
     if m._had == nil then
-      m._body, m._had, m._ctx = split_context(m.text)
+      m._body, m._had, m._ctx = CX.split_context(m.text)
       local at = m._body:find('[Attached files:]', 1, true)
       if at then
         local names = {}
@@ -3823,7 +2800,7 @@ do
       end
     end
     if m._had then ctx_tag(m, id) end
-    if m._body ~= '' then bubble(m, m._body) end
+    if m._body ~= '' then MD.bubble(m, m._body) end
     if m._files then
       ImGui.PushTextWrapPos(ctx, 0)
       ImGui.TextDisabled(ctx, 'Attached: ' .. m._files)
@@ -3841,7 +2818,7 @@ do
       flush()
       local skipped, y = skip(m, '_h', #m.text)
       if not skipped then
-        md(m, m.text)
+        MD.md(m, m.text)
         if not tools then ImGui.Spacing(ctx) end
         measured(m, '_h', #m.text, y)
       end
@@ -3898,7 +2875,7 @@ do
       if b.kind == 'text' then
         flush()
         local skipped, y = skip(b, '_h', #b.text)
-        if not skipped then md(b, b.text); measured(b, '_h', #b.text, y) end
+        if not skipped then MD.md(b, b.text); measured(b, '_h', #b.text, y) end
       else
         one[1] = b.text
         to_lane(b, 'live' .. i, one)
@@ -4070,7 +3047,7 @@ local function frame()
   if S.waiting and #S.greqs == 0 and t0 - S.greq_at > 3 then load_requests() end
   check_theme()
   pm('theme')
-  sel_tick()
+  CX.sel_tick()
   pm('sel')
   poll_http()
   pm('http')
@@ -4157,7 +3134,7 @@ local function frame()
       if S.sel and not S.sel_clicked and ImGui.IsMouseClicked(ctx, 0) then S.sel = nil end -- clicked elsewhere
       if S.sel and not S.comp_active and not S.sel.drag
           and ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_C) then
-        ImGui.SetClipboardText(ctx, selected_text(S.sel))
+        ImGui.SetClipboardText(ctx, MD.selected_text(S.sel))
       end
       local composer_h = 98 + cards_height(cards) + (#S.files > 0 and 30 or 0)
         + (sel_row_visible() and ImGui.GetFrameHeightWithSpacing(ctx) or 0) + (studio and studio.rack_height() or 0)
@@ -4213,10 +3190,13 @@ local function frame()
         if not ImGui.IsKeyDown(ctx, ImGui.Mod_Shift) then flags = flags | ImGui.InputTextFlags_CtrlEnterForNewLine end
         if ime == 'restore' then ImGui.Function_SetValue(ime_cb, 'restore', 1) end
       end
-      -- a request to clear ImGui's own buffer only makes sense while the input is active; when it isn't, the
-      -- emptied S.input is what ImGui loads on activation. Never leave the flag pending for a later frame.
-      if S.clear_input and S.comp_active then ImGui.Function_SetValue(ime_cb, 'clear', 1) end
-      S.clear_input = false
+      -- Lua changed S.input (sent, handed back, demo) while the field is active: ImGui would keep its own text, so
+      -- push it in. An inactive field loads S.input itself when it activates.
+      if S.comp_active and S.input ~= S.input_seen then
+        ImGui.Function_SetValue_String(ime_cb, '#prev', S.input)
+        ImGui.Function_SetValue(ime_cb, 'prev_cursor', #S.input)
+        ImGui.Function_SetValue(ime_cb, 'restore', 1)
+      end
       -- Cmd+V with files / a screenshot on the clipboard: attach them, and undo the names ImGui pastes as text
       if S.comp_active and (ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_V)
           or ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Super | ImGui.Key_V)) and ATT.paste() > 0 then
@@ -4224,10 +3204,13 @@ local function frame()
       end
       local before = S.input
       local entered
+      ImGui.Function_SetValue(ime_cb, 'ran', 0)
       entered, S.input = ImGui.InputTextMultiline(ctx, '##input', S.input, -1, 62, flags, ime_cb)
+      -- what is in the field now (typed, restored, a stripped newline); clicking elsewhere used to lose it
+      if ImGui.Function_GetValue(ime_cb, 'ran') == 1 then S.input = ImGui.Function_GetValue_String(ime_cb, '#prev') end
+      S.input_seen = S.input
       ATT.drop()
       -- callback flags are one-frame requests: an inactive input never ran the callback, so drop them here
-      ImGui.Function_SetValue(ime_cb, 'clear', 0)
       ImGui.Function_SetValue(ime_cb, 'restore', 0)
       ImGui.Function_SetValue(ime_cb, 'strip_nl', 0)
       local x1, y1 = ImGui.GetItemRectMin(ctx)
@@ -4237,7 +3220,7 @@ local function frame()
       S.comp_active = focused
       ImGui.DrawList_AddRect(ImGui.GetWindowDrawList(ctx), x1, y1, x2, y2,
         focused and C.value or C.btn_lo, RND, 0, 1)
-      if entered then send() end
+      if entered and ime ~= 'enter' then send() end -- an IME commit Enter returns true for its letters: not a send
       if chip('attach', '+ File', C.muted, false) then
         local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
         if ok then ATT.add(fn) end
@@ -4301,8 +3284,8 @@ S.boot = true
 load_agents()
 if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
-    greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
-    ONB = ONB, REC = REC, UPD = UPD, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
+    greq_card = greq_card, decode = decode, jstr = jstr, context = CX.context, sel_tick = CX.sel_tick, SEL = CX.SEL,
+    ONB = ONB, REC = REC, UPD = UPD, DIR = DIR, q = q, F = F, layout_md = MD.layout_md, md_layout = MD.md_layout,
     draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages,
     demo_tick = demo_tick, studio = studio, card_list = card_list, ATT = ATT }
 end

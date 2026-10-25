@@ -385,6 +385,93 @@ def test_failed_send_hands_text_back():
           and not p.S.active, (p.S.input, texts, p.S.err))
 
 
+def _composer(p):
+    """Fake the composer field: ReaImGui's InputTextMultiline hands the buffer back only when it returns true; the EEL
+    callback's variables live in FN. Returns the globals; set FIELD_ACTIVE / FN.ran / FN['#prev'] per frame."""
+    g = p.lua.globals()
+    p.lua.execute("""
+      FN, FIELD_ACTIVE, ENTERED = {}, false, false
+      RET.Function_SetValue = function(_, k, v) FN[k] = v end
+      RET.Function_SetValue_String = function(_, k, v) FN[k] = v end
+      RET.Function_GetValue = function(_, k) return FN[k] or 0 end
+      RET.Function_GetValue_String = function(_, k) return FN[k] or '' end
+      RET.InputTextMultiline = function(_, _, buf)
+        if FIELD_ACTIVE then FN.ran = 1 end -- the callback runs (and refreshes #prev) only while the field is active
+        if ENTERED then return true, FN['#prev'] or buf end
+        return false, buf
+      end
+      RET.IsItemActive = function() return FIELD_ACTIVE end
+      LAYOUT(400, 600)
+      RET.Begin = function(_, name) if name == 'Hibiki' then return true, true end end
+      RET.GetCursorPosX = function() return 0 end; RET.GetFrameHeight = function() return 20 end
+      RET.GetFrameHeightWithSpacing = function() return 26 end; RET.GetKeyMods = function() return 0 end
+      RET.GetItemRectMin = function() return 0, 0 end; RET.GetItemRectMax = function() return 0, 0 end
+    """)
+    return g
+
+
+def test_composer_keeps_typed_text():
+    p = Panel(SESSION)
+    p.boot()
+    g = _composer(p)
+    g.FIELD_ACTIVE = True
+    g.FN["#prev"] = "hello 你好"
+    p.m.frame()
+    check("composer: typed text reaches S.input before Enter", p.S.input == "hello 你好", p.S.input)
+    g.FIELD_ACTIVE = False  # clicked Context / + File / the log: the field deactivates
+    g.FN["#prev"] = "stale"
+    p.m.frame()
+    check("composer: clicking elsewhere keeps the draft", p.S.input == "hello 你好", p.S.input)
+    g.FIELD_ACTIVE = True
+    g.FN["#prev"] = "hello 你好"
+    p.m.frame()
+    p.requests()
+    g.ENTERED = True
+    p.m.frame()
+    g.ENTERED = False
+    sent = find(p.requests(), "POST", "/sessions/s1/messages")
+    check("composer: Enter sends the whole draft", len(sent) == 1 and sent[0].body["content"] == "hello 你好",
+          [r.body for r in sent])
+    g.FN.restore = 0
+    p.m.frame()
+    check("composer: the emptied input is pushed into the active field", g.FN["#prev"] == "" and g.FN.restore == 0
+          and p.S.input == "", (g.FN["#prev"], p.S.input))
+
+
+def test_composer_ime_enter_does_not_send():
+    p = Panel(SESSION)
+    p.boot()
+    g = _composer(p)
+    g.FIELD_ACTIVE = True
+    g.FN["#prev"] = "ab "
+    p.m.frame()
+    p.requests()
+    p.S.ime = "reaper"  # letters typed into an open pinyin composition
+    p.lua.execute("RET.IsKeyPressed = function(_, k) return k == ImGui.Key_Enter end")
+    g.FN["#prev"] = "ab reaper"
+    g.ENTERED = True  # without EnterReturnsTrue the field returns true because the committed letters changed it
+    p.m.frame()
+    g.ENTERED = False
+    p.lua.execute("RET.IsKeyPressed = nil")
+    check("composer: an IME commit Enter keeps the letters and sends nothing",
+          not find(p.requests(), "POST", "/sessions/s1/messages") and p.S.input == "ab reaper", p.S.input)
+
+
+def test_attachment_host_paths():
+    p = Panel(SESSION)
+    p.boot()
+    f = p.tmp / "take.wav"
+    f.write_text("x")
+    p.m.ATT.add(str(f))
+    reqs = p.type_and_send("import this")
+    (up,) = [r for r in reqs if r.url.endswith("/upload-file")]
+    p.reply(up, 200, {"success": True, "path": "/workspace/uploads/take.wav"})
+    (msg,) = find(p.requests(), "POST", "/sessions/s1/messages")
+    body = msg.body["content"]
+    check("attachments: the agent's copy is listed, the REAPER host path follows on its own line",
+          "- /workspace/uploads/take.wav\n(on the REAPER host: " + str(f) + ")" in body, body)
+
+
 def test_new_chat_login_hands_text_back():
     p = Panel({"agent": "acp-fake", "agent_name": "Fake"})
     p.boot()
@@ -1226,6 +1313,7 @@ def test_rack_keep():
           [x.name for x in t] == ["Bass B", "Keys"] and (t[0].ext.hibiki_var or "") == "" and t[0].mute == 0)
     p.m.studio.tick(5002)
     check("rack: the row is gone after Keep", len(p.lua_list(p.m.studio._RK.groups)) == 0)
+
 
 
 def test_rack_lanes():
