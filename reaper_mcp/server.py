@@ -32,12 +32,14 @@ FAST_POLL = 0.002
 FAST_POLL_WINDOW = 0.25
 RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
 RUN_LUA_MAX_TIMEOUT = 600
+RUN_LUA_DEFAULT_TIMEOUT = 10
+RUN_LUA_GRACE = 5  # the bridge stops a snippet at its timeout; wait a little longer for that answer
 
 
 def _run_lua_timeout(a):
     t = a.get("timeout")
     if t is None:
-        return None
+        return float(RUN_LUA_DEFAULT_TIMEOUT)
     return max(1.0, min(float(t), RUN_LUA_MAX_TIMEOUT))
 
 INSTRUCTIONS = (
@@ -166,7 +168,8 @@ class Bridge:
             pass
         fd.close()
 
-    def call(self, func: str, args=None, code: str | None = None, timeout: float | None = None):
+    def call(self, func: str, args=None, code: str | None = None, timeout: float | None = None,
+             lua_timeout: float | None = None):
         wait = timeout if timeout is not None else self.timeout
         fd = self._lock(wait)
         try:
@@ -187,6 +190,8 @@ class Bridge:
             payload = {"id": rid, "func": func}
             if code is not None:
                 payload["code"] = code
+                if lua_timeout is not None:
+                    payload["timeout"] = lua_timeout
             else:
                 payload["args"] = args or []
             try:
@@ -230,7 +235,8 @@ class Bridge:
             if withdrawn:
                 raise BridgeError("REAPER did not pick up the request in time (a modal dialog open?). "
                                   "It was withdrawn and will not run.")
-            raise BridgeError("Timed out waiting for REAPER to finish the request; it may still complete. "
+            raise BridgeError("Timed out waiting for REAPER to finish the request; it may still complete (a call "
+                              "blocked inside REAPER, e.g. ExecProcess or a dialog, can't be stopped). "
                               "Do not resend it: call status until REAPER is free. For slow work pass a "
                               "longer timeout (run_lua timeout=...), or start host commands in the "
                               "background (io.popen('cmd > log 2>&1 &')) and poll the log.")
@@ -293,22 +299,27 @@ CC = {
 
 tool(
     "status",
-    "Check the Lua bridge and return project tempo, play state, tracks, any_solo, master_mute and dirty "
-    "(unsaved changes). Call first; clear a lingering solo before rendering. "
-    "detail=true adds arrangement facts (time signature, length in beats, markers, "
-    "MIDI vs audio per track) without guessing chords.",
+    "Check the Lua bridge and return project tempo, play state, cursor_beats, tracks (selected=true on selected "
+    "ones), time_selection {start_beats, end_beats} when there is one, selected_items [{track_index, item_index}], "
+    "any_solo, master_mute and dirty (unsaved changes). Call first; clear a lingering solo before rendering. "
+    "detail=true adds arrangement facts (time signature at the start, tempo_map of tempo/meter changes, length in "
+    "beats, markers, MIDI vs audio per track) without guessing chords.",
     obj({"detail": {"type": "boolean"}}),
     lambda b, a: b.call("get_project_summary", [bool(a.get("detail"))]),
 )
 
 tool(
     "transport",
-    "Playback control. action: play, stop, pause, record, toggle_repeat, goto_start.",
+    "Playback control. action: play, stop, pause, record, toggle_repeat, goto_start, goto (edit cursor to "
+    "position_beats, or to a marker/region by number or name; moves playback too when playing). "
+    "Returns play_state, position_sec and position_beats.",
     obj({"action": {"type": "string",
                     "enum": ["play", "stop", "pause", "record",
-                             "toggle_repeat", "goto_start"]}},
+                             "toggle_repeat", "goto_start", "goto"]},
+         "position_beats": {"type": "number", "minimum": 0},
+         "marker": {"type": ["string", "integer"]}},
         ["action"]),
-    lambda b, a: b.call("transport", [a["action"]]),
+    lambda b, a: b.call("transport", [a["action"], _props(a, ("position_beats", "marker")) or None]),
 )
 
 tool(
@@ -340,13 +351,14 @@ tool(
 tool(
     "midi",
     "MIDI on a track item. Times are absolute project beats. "
-    "action: create_item | add | get | replace | update | delete | cc. "
+    "action: create_item | add | get | replace | update | delete | cc | get_cc. "
     "replace rewrites the whole take in one undo step; add only appends. "
-    "cc inserts CC (`cc`+`value`) or program change (`program`) via ccs[]. "
+    "cc inserts CC (`cc`+`value`) or program change (`program`) via ccs[]; get_cc reads CC, program and "
+    "pitch_bend back in that shape. "
     "get omits index (use array offset), channel if 0, muted/selected if false.",
     obj({
         "action": {"type": "string",
-                   "enum": ["create_item", "add", "get", "replace", "update", "delete", "cc"]},
+                   "enum": ["create_item", "add", "get", "replace", "update", "delete", "cc", "get_cc"]},
         "track_index": {"type": "integer", "minimum": 0},
         "item_index": {"type": "integer", "minimum": 0},
         "start_beats": {"type": "number", "minimum": 0},
@@ -376,12 +388,14 @@ tool(
                                  [a["track_index"], a["item_index"], a["note_indices"]]),
         "cc": lambda: b.call("add_midi_cc",
                              [a["track_index"], a["item_index"], a.get("ccs") or []]),
+        "get_cc": lambda: b.call("get_midi_cc", [a["track_index"], a["item_index"]]),
     }[a["action"]](),
 )
 
 tool(
     "fx",
     "Track FX. action: list | add | params | set | delete | bypass | move | preset. "
+    "params takes filter (case-insensitive part of the parameter name) to list only matching ones. "
     "track_index -1 is the master. set takes value 0..1 (REAPER normalized) or formatted: the value as the "
     "plugin displays it (number in its unit, e.g. -18 for dB, 4 for 4:1, 120 for ms; or a label like "
     "\"3.2k\"), resolved by searching the display text. set returns the formatted value actually set.",
@@ -397,11 +411,12 @@ tool(
         "enabled": {"type": "boolean"},
         "dest_index": {"type": "integer", "minimum": 0},
         "preset": {"type": "string"},
+        "filter": {"type": "string"},
     }, ["action", "track_index"]),
     lambda b, a: {
         "list": lambda: b.call("list_track_fx", [a["track_index"]]),
         "add": lambda: b.call("add_track_fx", [a["track_index"], a["fx_name"]]),
-        "params": lambda: b.call("get_fx_params", [a["track_index"], a["fx_index"]]),
+        "params": lambda: b.call("get_fx_params", [a["track_index"], a["fx_index"], a.get("filter")]),
         "set": lambda: b.call("set_fx_param",
                               [a["track_index"], a["fx_index"], a["param"], a.get("value"),
                                a.get("formatted")]),
@@ -444,32 +459,51 @@ tool(
     }[a["action"]](),
 )
 
+FADE_SHAPES = ["linear", "fast_start", "fast_end", "fast_start_steep", "fast_end_steep", "s_curve", "s_curve_steep"]
+ITEM_PROPS = ("gain_db", "fade_in_sec", "fade_out_sec", "fade_in_shape", "fade_out_shape", "loop", "mute",
+              "position_beats", "length_beats", "left_edge_beats", "dest_track_index", "active_take")
+
 tool(
     "item",
-    "Media items on a track. action: list | update | import. "
-    "fade_in / fade_out are seconds (REAPER native). position/length are beats. "
-    "import uses a path already on the REAPER host; as_new_track=true makes new tracks.",
+    "Media items on a track. action: list | update | import | split | delete | duplicate. "
+    "Times are beats except fade_in_sec / fade_out_sec (seconds, REAPER native). "
+    "update: gain_db, fades and fade_*_shape, loop, mute, position_beats (move), length_beats (trim the end), "
+    "left_edge_beats (trim or extend the start; the content stays in place), dest_track_index (move to another "
+    "track; returns the new indices), active_take. list shows take name, source file and take count. "
+    "split cuts at at_beats (inside the item) and returns the pieces' item_indices. delete takes item_index or "
+    "item_indices. duplicate copies the item (unpooled) to position_beats (default: right after it), optionally "
+    "on dest_track_index. import uses a path already on the REAPER host; as_new_track=true makes new tracks. "
+    "Item indices follow position, so re-list after edits that move items.",
     obj({
-        "action": {"type": "string", "enum": ["list", "update", "import"]},
+        "action": {"type": "string", "enum": ["list", "update", "import", "split", "delete", "duplicate"]},
         "track_index": {"type": "integer", "minimum": 0},
         "item_index": {"type": "integer", "minimum": 0},
+        "item_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}},
         "gain_db": {"type": "number"},
-        "fade_in": {"type": "number", "minimum": 0},
-        "fade_out": {"type": "number", "minimum": 0},
+        "fade_in_sec": {"type": "number", "minimum": 0},
+        "fade_out_sec": {"type": "number", "minimum": 0},
+        "fade_in_shape": {"type": "string", "enum": FADE_SHAPES},
+        "fade_out_shape": {"type": "string", "enum": FADE_SHAPES},
         "loop": {"type": "boolean"},
         "mute": {"type": "boolean"},
         "position_beats": {"type": "number", "minimum": 0},
         "length_beats": {"type": "number", "minimum": 0},
+        "left_edge_beats": {"type": "number", "minimum": 0},
+        "dest_track_index": {"type": "integer", "minimum": 0},
+        "active_take": {"type": "integer", "minimum": 0},
+        "at_beats": {"type": "array", "items": {"type": "number", "minimum": 0}},
         "start_beats": {"type": "number", "minimum": 0},
         "path": {"type": "string"},
         "as_new_track": {"type": "boolean"},
     }, ["action"]),
     lambda b, a: {
         "list": lambda: b.call("list_items", [a["track_index"]]),
-        "update": lambda: b.call("update_item", [a["track_index"], a["item_index"],
-                                                 _props(a, ("gain_db", "fade_in", "fade_out",
-                                                            "loop", "mute", "position_beats",
-                                                            "length_beats"))]),
+        "update": lambda: b.call("update_item", [a["track_index"], a["item_index"], _props(a, ITEM_PROPS)]),
+        "split": lambda: b.call("split_item", [a["track_index"], a["item_index"], a["at_beats"]]),
+        "delete": lambda: b.call("delete_items", [a["track_index"], a.get("item_indices")
+                                                  or [a["item_index"]]]),
+        "duplicate": lambda: b.call("duplicate_item", [a["track_index"], a["item_index"],
+                                                       _props(a, ("position_beats", "dest_track_index")) or None]),
         "import": lambda: b.call("import_media", [a.get("path"), {
             "track_index": a.get("track_index"),
             "start_beats": a.get("start_beats"),
@@ -482,7 +516,8 @@ tool(
     "envelope",
     "Track envelopes. action: list | get | set. "
     "name is REAPER envelope name (Volume, Pan, Mute, ...). "
-    "set replaces all points. value is the envelope's value; Volume is linear gain (1.0 = 0 dB, "
+    "set replaces all points, or with start_beats / end_beats only the points in that range (ends included; "
+    "every new point must lie inside it); get with a range returns only those points. value is the envelope's value; Volume is linear gain (1.0 = 0 dB, "
     "0.5 = -6 dB), also on fader-scaled envelopes. unit=db reads/writes volume-type envelopes "
     "(Volume, Trim Volume, send Volume) in dB. set re-activates an envelope left inactive (ACT 0).",
     obj({
@@ -491,6 +526,8 @@ tool(
         "name": {"type": "string"},
         "envelope_index": {"type": "integer", "minimum": 0},
         "unit": {"type": "string", "enum": ["gain", "db"]},
+        "start_beats": {"type": "number", "minimum": 0},
+        "end_beats": {"type": "number", "minimum": 0},
         "points": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -507,10 +544,11 @@ tool(
         "list": lambda: b.call("list_envelopes", [a["track_index"]]),
         "get": lambda: b.call("get_envelope",
                               [a["track_index"], a.get("name", a.get("envelope_index", 0)),
-                               a.get("unit")]),
+                               a.get("unit"), _props(a, ("start_beats", "end_beats")) or None]),
         "set": lambda: b.call("set_envelope",
                               [a["track_index"], a.get("name", a.get("envelope_index", 0)),
-                               a.get("points") or [], a.get("unit")]),
+                               a.get("points") or [], a.get("unit"),
+                               _props(a, ("start_beats", "end_beats")) or None]),
     }[a["action"]](),
 )
 
@@ -555,7 +593,9 @@ tool(
     "already exists (REAPER's overwrite prompt would hang the bridge) and when tracks are soloed (pass "
     "allow_solo=true, or solo_indices / mute_indices to solo/mute tracks for this render only; they are "
     "restored afterwards). Returns files [{path, bytes, length_sec, peak_db, lufs_i}] and warnings "
-    "(near-silent, missing file, master muted); measure=false skips the loudness scan.",
+    "(near-silent, missing file, master muted); measure=false skips the loudness scan. "
+    "format wav (bit_depth 16 | 24 | 32 = float) or mp3 (320 kbps) sets the file type for this render only; "
+    "without it the project's render format is used.",
     obj({
         "path": {"type": "string"},
         "bounds": {"type": "string",
@@ -572,6 +612,8 @@ tool(
         "allow_solo": {"type": "boolean"},
         "media_online": {"type": "boolean"},
         "measure": {"type": "boolean"},
+        "format": {"type": "string", "enum": ["wav", "mp3"]},
+        "bit_depth": {"type": "integer", "enum": [16, 24, 32]},
     }),
     lambda b, a: b.call("render_project", [a.get("path"), {
         "bounds": a.get("bounds") or "project",
@@ -587,6 +629,8 @@ tool(
         "allow_solo": a.get("allow_solo"),
         "media_online": a.get("media_online"),
         "measure": a.get("measure"),
+        "format": a.get("format"),
+        "bit_depth": a.get("bit_depth"),
     }], timeout=RENDER_TIMEOUT),
 )
 
@@ -609,26 +653,32 @@ tool(
     "run_lua",
     "Run a Lua snippet inside REAPER (`reaper` in scope). Use return to send a value. "
     "Best for multi-step work that would otherwise be many round-trips. Errors carry the failing line. "
-    "timeout (seconds, default 10, max 600) is for slow work; REAPER is frozen meanwhile, so start long "
-    "host commands in the background (io.popen('cmd > log 2>&1 &')) and poll instead.",
+    "timeout (seconds, default 10, max 600): a snippet still running Lua after it is stopped with an error "
+    "(what it did until then stays done); a call blocked inside REAPER (ExecProcess, a render, a dialog) can't "
+    "be stopped. REAPER is frozen while it runs, so start long host commands in the background "
+    "(io.popen('cmd > log 2>&1 &')) and poll instead.",
     obj({"code": {"type": "string"},
          "timeout": {"type": "number", "minimum": 1, "maximum": RUN_LUA_MAX_TIMEOUT}}, ["code"]),
-    lambda b, a: b.call("run_lua", code=a["code"], timeout=_run_lua_timeout(a)),
+    lambda b, a: b.call("run_lua", code=a["code"], timeout=_run_lua_timeout(a) + RUN_LUA_GRACE,
+                        lua_timeout=_run_lua_timeout(a)),
 )
 
 tool(
     "batch",
-    "Many operations in one IPC hop. Each call is {func, args} or {func, code} "
-    "or {func, arguments} for a grouped tool name (track/midi/fx/...). "
-    "Each slot is the inner result, or {error}. One failure does not abort the rest. "
+    "Many operations in one IPC hop and one undo point. Each call is {func, args} or {func: 'run_lua', code, "
+    "timeout} or {func, arguments} for a grouped tool name (track/midi/fx/...). "
+    "Each slot is the inner result, or {error}. There is no rollback: by default one failure does not abort the "
+    "rest; stop_on_error=true skips the slots after the first failure ({skipped: true}). "
     "Handles from earlier calls work later.",
     obj({"calls": {"type": "array", "items": obj({
         "func": {"type": "string"},
         "args": {"type": "array"},
         "arguments": {"type": "object"},
         "code": {"type": "string"},
+        "timeout": {"type": "number", "minimum": 1, "maximum": RUN_LUA_MAX_TIMEOUT},
         "action": {"type": "string"}},
-        ["func"])}},
+        ["func"])},
+         "stop_on_error": {"type": "boolean"}},
         ["calls"]),
     lambda b, a: _build_batch(b, a),
 )
@@ -636,7 +686,8 @@ tool(
 
 def _build_batch(bridge, a):
     calls, timeout = _normalize_batch(a["calls"])
-    return bridge.call("batch", [calls], timeout=timeout)
+    args = [calls, {"stop_on_error": True}] if a.get("stop_on_error") else [calls]
+    return bridge.call("batch", args, timeout=timeout)
 
 
 def _expand_grouped(func, arguments):
@@ -656,7 +707,7 @@ class _BatchCapture:
     def __init__(self) -> None:
         self.timeout = None
 
-    def call(self, func, args=None, code=None, timeout=None):
+    def call(self, func, args=None, code=None, timeout=None, lua_timeout=None):
         if timeout is not None:
             self.timeout = (self.timeout or 0.0) + timeout
         call = {"func": func}
@@ -689,6 +740,10 @@ def _normalize_batch(calls):
             out.append(call)
             if func == "render_project":
                 call_timeout = RENDER_TIMEOUT
+            elif func == "run_lua":
+                lt = _run_lua_timeout(call)
+                call["timeout"] = lt
+                call_timeout = lt + RUN_LUA_GRACE
         if call_timeout:
             timeout = (timeout or 0.0) + call_timeout
     return out, timeout

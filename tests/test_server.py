@@ -104,8 +104,8 @@ class _Recorder:
     def __init__(self):
         self.sent = []
 
-    def call(self, func, args=None, code=None, timeout=None):
-        self.sent.append({"func": func, "args": args, "code": code, "timeout": timeout})
+    def call(self, func, args=None, code=None, timeout=None, lua_timeout=None):
+        self.sent.append({"func": func, "args": args, "code": code, "timeout": timeout, "lua_timeout": lua_timeout})
         return None
 
 
@@ -134,20 +134,48 @@ def check_tool_params():
     assert c["args"] == [3, 0, {"volume_db": -3, "src_channel": 0}], c
     c = _build("envelope", {"action": "set", "track_index": 1, "name": "Trim Volume",
                             "points": [{"beats": 0, "value": -3}], "unit": "db"})
-    assert c["args"] == [1, "Trim Volume", [{"beats": 0, "value": -3}], "db"], c
+    assert c["args"] == [1, "Trim Volume", [{"beats": 0, "value": -3}], "db", None], c
     c = _build("envelope", {"action": "get", "track_index": 1, "name": "Volume"})
-    assert c["args"] == [1, "Volume", None], c
+    assert c["args"] == [1, "Volume", None, None], c
+    c = _build("envelope", {"action": "set", "track_index": 1, "name": "Volume", "start_beats": 8, "end_beats": 16,
+                            "points": [{"beats": 8, "value": 1}]})
+    assert c["args"][4] == {"start_beats": 8, "end_beats": 16}, c
     c = _build("render", {"path": "/tmp/r", "pattern": "a", "solo_indices": [2], "mute_indices": [4],
                           "allow_solo": True, "media_online": False, "measure": False})
     opts = c["args"][1]
     assert opts["solo_indices"] == [2] and opts["mute_indices"] == [4] and opts["allow_solo"] is True
     assert opts["media_online"] is False and opts["measure"] is False and c["timeout"] == server.RENDER_TIMEOUT, c
     c = _build("run_lua", {"code": "return 1"})
-    assert c["code"] == "return 1" and c["timeout"] is None, c
+    assert c["code"] == "return 1" and c["lua_timeout"] == 10 and c["timeout"] == 10 + server.RUN_LUA_GRACE, c
     c = _build("run_lua", {"code": "return 1", "timeout": 120})
-    assert c["timeout"] == 120.0, c
+    assert c["lua_timeout"] == 120.0 and c["timeout"] == 120 + server.RUN_LUA_GRACE, c
     c = _build("run_lua", {"code": "return 1", "timeout": 99999})
-    assert c["timeout"] == server.RUN_LUA_MAX_TIMEOUT, c
+    assert c["lua_timeout"] == server.RUN_LUA_MAX_TIMEOUT, c
+    # 2026-10-24 review: arrange verbs, ranges, selection, formats
+    c = _build("item", {"action": "update", "track_index": 0, "item_index": 1, "fade_in_sec": 0.1,
+                        "fade_out_shape": "s_curve", "left_edge_beats": 4, "dest_track_index": 2, "active_take": 1})
+    assert c["func"] == "update_item" and c["args"][2] == {"fade_in_sec": 0.1, "fade_out_shape": "s_curve",
+                                                           "left_edge_beats": 4, "dest_track_index": 2,
+                                                           "active_take": 1}, c
+    c = _build("item", {"action": "split", "track_index": 0, "item_index": 1, "at_beats": [8, 4]})
+    assert c["func"] == "split_item" and c["args"] == [0, 1, [8, 4]], c
+    c = _build("item", {"action": "delete", "track_index": 0, "item_index": 3})
+    assert c["func"] == "delete_items" and c["args"] == [0, [3]], c
+    c = _build("item", {"action": "duplicate", "track_index": 0, "item_index": 3, "position_beats": 32})
+    assert c["func"] == "duplicate_item" and c["args"] == [0, 3, {"position_beats": 32}], c
+    c = _build("transport", {"action": "goto", "marker": "Chorus"})
+    assert c["args"] == ["goto", {"marker": "Chorus"}], c
+    c = _build("transport", {"action": "play"})
+    assert c["args"] == ["play", None], c
+    c = _build("midi", {"action": "get_cc", "track_index": 0, "item_index": 0})
+    assert c["func"] == "get_midi_cc", c
+    c = _build("fx", {"action": "params", "track_index": 0, "fx_index": 0, "filter": "attack"})
+    assert c["args"] == [0, 0, "attack"], c
+    c = _build("render", {"format": "wav", "bit_depth": 16})
+    assert c["args"][1]["format"] == "wav" and c["args"][1]["bit_depth"] == 16, c
+    c = _build("batch", {"calls": [{"func": "run_lua", "code": "return 1", "timeout": 30}], "stop_on_error": True})
+    assert c["args"][1] == {"stop_on_error": True} and c["args"][0][0]["timeout"] == 30, c
+    assert c["timeout"] == 30 + server.RUN_LUA_GRACE, c
     schema = server.TOOL_INDEX["run_lua"]["inputSchema"]
     assert schema["properties"]["timeout"]["maximum"] == server.RUN_LUA_MAX_TIMEOUT
     return True

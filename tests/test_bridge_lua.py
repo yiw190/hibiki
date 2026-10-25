@@ -647,6 +647,174 @@ def main() -> None:
     check("run_lua runtime error quotes the failing line",
           r.get("ok") is False and "[line 3: return t.x]" in (r.get("error") or ""), r)
 
+    # --- 2026-10-24: arrange verbs, ranges, selection, guards ----------------
+    g.ext_state["Hibiki/turn"] = "arr.1"
+    lua.execute("""
+      tracks = { new_track("A"), new_track("B") }
+      tracks[1].items[1] = new_item(0.0, 4.0)      -- beats 0..8 (fake tempo: 1 beat = 0.5 s)
+      tracks[1].items[1].ccs = { { ppq = 960, chanmsg = 0xB0, chan = 1, msg2 = 64, msg3 = 127 },
+                                 { ppq = 0, chanmsg = 0xE0, chan = 0, msg2 = 0, msg3 = 64 } }
+      tracks[2].selected = true
+      tracks[1].items[1].selected = true
+      time_sel = { 1.0, 3.0 }
+      tempo_markers = { { time = 0, bpm = 120, num = 4, den = 4 }, { time = 8, bpm = 90, num = 3, den = 4 } }
+    """)
+    r = rpc("get_project_summary", [False])["ret"]
+    check("status: time selection in beats", r.get("time_selection") == {"start_beats": 2.0, "end_beats": 6.0}, r)
+    check("status: selected tracks and items", r["tracks"][1].get("selected") is True
+          and "selected" not in r["tracks"][0] and r.get("selected_items") == [{"track_index": 0, "item_index": 0}], r)
+    r = rpc("get_project_summary", [True])["ret"]
+    check("status detail: tempo_map lists the meter change", len(r.get("tempo_map", [])) == 2
+          and r["tempo_map"][1] == {"beats": 16.0, "bpm": 90, "numerator": 3, "denominator": 4}, r.get("tempo_map"))
+
+    r = rpc("split_item", [0, 0, [6, 2]])
+    items = g.tracks[1]["items"]
+    check("split: sorted cuts give three pieces left to right",
+          r.get("ok") and r["ret"]["item_indices"] == [0, 1, 2] and len(items) == 3
+          and abs(items[3]["position"] - 3.0) < 1e-9 and abs(items[2]["length"] - 2.0) < 1e-9, r)
+    r = rpc("split_item", [0, 0, [50]])
+    check("split: a beat outside the item is refused", r.get("ok") is False and "not inside" in r["error"], r)
+    r = rpc("update_item", [0, 1, {"left_edge_beats": 3, "fade_in_sec": 0.2, "fade_out_shape": "s_curve"}])
+    it = g.tracks[1]["items"][2]
+    check("update: left edge moves the start, content stays (offset grows)",
+          r.get("ok") and abs(it["position"] - 1.5) < 1e-9 and abs(it["length"] - 1.5) < 1e-9
+          and abs(it["offs"] - 1.5) < 1e-9, dict(it))
+    check("update: fade seconds and shape", it["info"]["D_FADEINLEN"] == 0.2 and it["info"]["C_FADEOUTSHAPE"] == 5)
+    r = rpc("update_item", [0, 1, {"fade_in_shape": "wobbly"}])
+    check("update: unknown fade shape lists the names", r.get("ok") is False and "s_curve" in r["error"], r)
+    r = rpc("list_items", [0])["ret"]
+    check("list: fade_in_sec / shape named", r[1]["fade_in_sec"] == 0.2 and r[1]["fade_out_shape"] == "s_curve", r[1])
+    r = rpc("duplicate_item", [0, 0, {"position_beats": 20}])
+    check("duplicate: copy lands at the beat with new GUIDs",
+          r.get("ok") and r["ret"] == {"track_index": 0, "item_index": 3}
+          and abs(g.tracks[1]["items"][4]["position"] - 10.0) < 1e-9
+          and "AAAAAAAA" not in g.tracks[1]["items"][4]["chunk"], r)
+    r = rpc("update_item", [0, 3, {"dest_track_index": 1}])
+    check("update: dest_track_index moves it and returns the new place",
+          r.get("ok") and r["ret"] == {"track_index": 1, "item_index": 0} and len(g.tracks[2]["items"]) == 1, r)
+    r = rpc("delete_items", [0, [0, 2]])
+    check("delete: several at once", r.get("ok") and r["ret"]["deleted"] == 2 and len(g.tracks[1]["items"]) == 1, r)
+    lua.execute("tracks[1].items[1].takes = { { audio = '/Users/me/take2.wav', take_name = 'Take 2' } }")
+    r = rpc("update_item", [0, 0, {"active_take": 1}])
+    lst = rpc("list_items", [0])["ret"][0]
+    check("takes: switch the active take; list shows its name, source and count",
+          r.get("ok") and lst.get("take") == "Take 2" and lst.get("source") == "/Users/me/take2.wav"
+          and lst.get("takes") == 2 and lst.get("active_take") == 1, lst)
+    r = rpc("update_item", [0, 0, {"active_take": 5}])
+    check("takes: a missing take is refused", r.get("ok") is False and "no take 5" in r["error"], r)
+
+    lua.execute("""tracks[1].items[1].curtake = 0
+      tracks[1].items[1].ccs = { { ppq = 960, chanmsg = 0xB0, chan = 1, msg2 = 64, msg3 = 127 },
+                                 { ppq = 0, chanmsg = 0xE0, chan = 0, msg2 = 0, msg3 = 64 } }""")
+    r = rpc("get_midi_cc", [0, 0])
+    check("midi get_cc: CC and pitch bend in the cc tool's shape",
+          r.get("ok") and {"start_beats": 1.0, "cc": 64, "value": 127, "channel": 1} in r["ret"]
+          and {"start_beats": 0.0, "pitch_bend": 0} in r["ret"], r)
+
+    # fake envelope points are in seconds: beats 0, 4, 8, 12
+    lua.execute("""tracks[1].envelopes = { { name = 'Volume', points = { {0, 1}, {2, 1}, {4, 1}, {6, 1} } } }""")
+    r = rpc("set_envelope", [0, "Volume", [{"beats": 4, "value": 0.5}, {"beats": 6, "value": 0.25}], None,
+                             {"start_beats": 4, "end_beats": 8}])
+    pts = [list(x.values()) for x in g.tracks[1]["envelopes"][1]["points"].values()]
+    check("envelope set with a range replaces only the points inside it (ends included)",
+          r.get("ok") and [round(x[0], 6) for x in pts] == [0, 2, 3, 6] and pts[1][1] == 0.5, pts)
+    r = rpc("set_envelope", [0, "Volume", [{"beats": 1, "value": 1}], None, {"start_beats": 4, "end_beats": 8}])
+    check("envelope set refuses a point outside the range", r.get("ok") is False and "outside" in r["error"], r)
+    r = rpc("get_envelope", [0, "Volume", None, {"start_beats": 2, "end_beats": 6}])
+    check("envelope get with a range", r.get("ok") and [x["beats"] for x in r["ret"]["points"]] == [4, 6], r)
+
+    lua.execute("tracks[1].fx = true tracks[1].fxp = {}")
+    r = rpc("get_fx_params", [0, 0, "rat"])
+    check("fx params filter", r.get("ok") and [x["name"] for x in r["ret"]] == ["Ratio"], r)
+
+    lua.execute("markers = { { pos = 12.0, name = 'Chorus', idx = 3 } } cursor = 0")
+    r = rpc("transport", ["goto", {"marker": "chorus"}])
+    check("transport goto a marker by name", r.get("ok") and r["ret"]["position_beats"] == 24.0
+          and r["ret"]["position_sec"] == 12.0, r)
+    r = rpc("transport", ["goto", {"marker": 3}])
+    check("transport goto a marker by number", r.get("ok") and r["ret"]["position_beats"] == 24.0, r)
+    r = rpc("transport", ["goto", {"position_beats": 8}])
+    check("transport goto a beat", r.get("ok") and r["ret"]["position_beats"] == 8.0, r)
+    r = rpc("transport", ["goto", {"marker": "Bridge"}])
+    check("transport goto a missing marker", r.get("ok") is False and "Bridge" in r["error"], r)
+
+    r = rpc("batch", [[{"func": "update_track", "args": [0, {"name": "x"}]},
+                       {"func": "update_track", "args": [9, {"name": "y"}]},
+                       {"func": "update_track", "args": [1, {"name": "z"}]}], {"stop_on_error": True}])
+    check("batch stop_on_error skips what follows the failure",
+          r.get("ok") and "error" in r["ret"][1] and r["ret"][2] == {"skipped": True} and g.tracks[2]["name"] == "B", r)
+
+    lua.execute("clock_step = 0.05")
+    r = rpc("run_lua", code="local n = 0 while true do n = n + 1 end")
+    lua.execute("clock_step = 0")
+    check("run_lua: a runaway loop is stopped at its timeout", r.get("ok") is False
+          and "still running after 10 s" in (r.get("error") or ""), r)
+    r = rpc("run_lua", code="return 7")
+    check("run_lua works again after a stopped snippet", r.get("ok") and r["ret"] == 7, r)
+
+    lua.execute("proj_str.RENDER_FORMAT = 'ZmxhYwAAAAA='")
+    r = rpc("render_project", ["/tmp", {"bounds": "project", "pattern": "fmt_test_%d" % os.getpid(), "format": "wav",
+                                        "bit_depth": 16, "measure": False}])
+    check("render format for this render only, then the project's comes back",
+          r.get("ok") and g.proj_str["RENDER_FORMAT"] == "ZmxhYwAAAAA=", r)
+    r = rpc("render_project", ["/tmp", {"format": "wav", "bit_depth": 20}])
+    check("render: a bad bit depth is refused", r.get("ok") is False and "bit_depth" in r["error"], r)
+
+    # a reply is pinned to the project tab it started on
+    g.ext_state["Hibiki/turn"] = "pin.1"
+    check("guard: first write pins the tab", rpc("update_track", [0, {"name": "p1"}]).get("ok"))
+    lua.execute("active_proj = 1")
+    r = rpc("update_track", [0, {"name": "p2"}])
+    check("guard: a panel reply can't write after the user switched tabs",
+          r.get("ok") is False and "refused" in r["error"] and g.tracks[1]["name"] == "p1", r)
+    check("guard: reads still work", rpc("get_project_summary", [False]).get("ok"))
+    check("guard: still refused later in the same reply", rpc("update_track", [0, {"name": "p3"}]).get("ok") is False)
+    g.ext_state["Hibiki/turn"] = "pin.2"
+    check("guard: the next reply works on the new tab", rpc("update_track", [0, {"name": "p4"}]).get("ok"))
+    g.ext_state["Hibiki/turn"] = ""
+    rpc("update_track", [0, {"name": "m1"}])
+    lua.execute("active_proj = 0")
+    r1 = rpc("update_track", [0, {"name": "m2"}])
+    r2 = rpc("update_track", [0, {"name": "m3"}])
+    check("guard: without the panel the switch is refused once, then followed",
+          r1.get("ok") is False and "refused once" in r1["error"] and r2.get("ok"), (r1, r2))
+
+    # a second REAPER's bridge: the request is claimed by rename, so only one bridge runs it
+    if os.path.exists(resp):
+        os.remove(resp)
+    with open(req, "w", encoding="utf-8") as f:
+        json.dump({"id": "c1", "func": "ping", "args": []}, f)
+    os.rename(req, os.path.join(ipc_dir, "request.other.claimed"))
+    g.pump(3)
+    check("mailbox: a request another bridge claimed is not run here", not os.path.exists(resp))
+    os.remove(os.path.join(ipc_dir, "request.other.claimed"))
+    # a second REAPER (its own Lua state, so another instance id) waits while this one's heartbeat is fresh
+    g.pump(1)  # fresh heartbeat
+    lua2 = lupa.LuaRuntime()
+    lua2.execute(COMPAT)
+    lua2.execute(FAKE.read_text(encoding="utf-8"))
+    lua2.execute("now = 2345.678")  # another process: another clock reading at startup
+    lua2.execute(BRIDGE.read_text(encoding="utf-8"))
+    with open(req, "w", encoding="utf-8") as f:
+        json.dump({"id": "w1", "func": "ping", "args": []}, f)
+    lua2.globals().pump(5)
+    check("second REAPER: leaves the mailbox alone while the first one is alive", os.path.exists(req))
+    g.pump(1)
+    check("first REAPER: still serves", os.path.exists(resp) and json.load(open(resp))["id"] == "w1")
+    with open(os.path.join(ipc_dir, "heartbeat"), "w") as f:
+        f.write("gone 0")
+    lua2.globals().pump(90)  # past its one-second recheck; taking over clears the old mailbox files
+    if os.path.exists(resp):
+        os.remove(resp)
+    with open(req, "w", encoding="utf-8") as f:
+        json.dump({"id": "w2", "func": "ping", "args": []}, f)
+    lua2.globals().pump(2)
+    check("second REAPER: takes over once the first one's heartbeat is stale",
+          os.path.exists(resp) and json.load(open(resp))["id"] == "w2")
+    g.pump(1)  # the first bridge is still running in this test: put its heartbeat back
+    heart = open(os.path.join(ipc_dir, "heartbeat")).read()
+    check("heartbeat names this REAPER", len(heart.split()) == 2 and heart.split()[1].isdigit(), heart)
+
     json_checks(lupa, check)
 
     # --- the bridge is still responsive -------------------------------

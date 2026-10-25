@@ -51,7 +51,9 @@ reaper = {}
 
 reaper.GetOS = function() return "OSX64" end
 reaper.GetAppVersion = function() return "7.99/fake" end
-reaper.time_precise = function() return now end
+-- clock_step > 0: every read moves the clock on (a loop that runs for "seconds" inside one request)
+clock_step = 0
+reaper.time_precise = function() now = now + clock_step return now end
 reaper.ShowConsoleMsg = function() hit("ShowConsoleMsg") end
 reaper.RecursiveCreateDirectory = function() hit("RecursiveCreateDirectory") end
 reaper.defer = function(f) hit("defer") ticks[#ticks + 1] = f end
@@ -431,3 +433,141 @@ reaper.TrackFX_GetFXGUID = function(t, i) return t.fx and ("{FX-" .. reaper.GetT
 reaper.TrackFX_GetFXName = function(t, i) return true, "ReaComp" end
 reaper.TrackFX_GetEnabled = function(t) return not t.fx_bypassed end
 reaper.TrackFX_GetOffline = function() return false end
+
+-- ---------------------------------------------------------------- 2026-10-24: arrange verbs, selection, tempo map
+local function track_of(it)
+  for _, t in ipairs(tracks) do
+    for i, x in ipairs(t.items) do if x == it then return t, i end end
+  end
+end
+local function sort_items(t) table.sort(t.items, function(a, b) return a.position < b.position end) end
+reaper.GetMediaItem_Track = function(it) return it.track or track_of(it) end
+reaper.IsTrackSelected = function(t) return t.selected == true end
+time_sel = { 0, 0 }
+reaper.GetSet_LoopTimeRange2 = function(_, set, _, s, e)
+  if set then time_sel = { s, e } end
+  return time_sel[1], time_sel[2]
+end
+reaper.CountSelectedMediaItems = function()
+  local n = 0
+  for _, t in ipairs(tracks) do for _, it in ipairs(t.items) do if it.selected then n = n + 1 end end end
+  return n
+end
+reaper.GetSelectedMediaItem = function(_, k)
+  local n = 0
+  for _, t in ipairs(tracks) do
+    for _, it in ipairs(t.items) do
+      if it.selected then
+        if n == k then return it end
+        n = n + 1
+      end
+    end
+  end
+end
+tempo_markers = {}
+reaper.CountTempoTimeSigMarkers = function() return #tempo_markers end
+reaper.GetTempoTimeSigMarker = function(_, i)
+  local m = tempo_markers[i + 1]
+  return true, m.time, 0, 0, m.bpm, m.num or 0, m.den or 0, m.linear or false
+end
+play_pos = 0
+reaper.GetPlayPosition = function() return play_pos end
+reaper.GetCursorPosition = function() return cursor or 0.0 end
+active_proj = 0
+reaper.EnumProjects = function() return active_proj, project_path end
+
+-- item properties beyond the basics live in it.info
+local base_get, base_set = reaper.GetMediaItemInfo_Value, reaper.SetMediaItemInfo_Value
+reaper.GetMediaItemInfo_Value = function(it, key)
+  if key == "D_FADEINLEN" or key == "D_FADEOUTLEN" or key == "C_FADEINSHAPE" or key == "C_FADEOUTSHAPE"
+      or key == "I_CURTAKE" then
+    hit("item." .. key)
+    if key == "I_CURTAKE" then return it.curtake or 0 end
+    return (it.info or {})[key] or 0
+  end
+  return base_get(it, key)
+end
+reaper.SetMediaItemInfo_Value = function(it, key, v)
+  it.info = it.info or {}
+  it.info[key] = v
+  return base_set(it, key, v)
+end
+-- takes: the item is its own first take (as before); it.takes = { take2, ... } adds more
+reaper.CountTakes = function(it) return 1 + #(it.takes or {}) end
+reaper.GetTake = function(it, i) if i == 0 then return it end return (it.takes or {})[i] end
+reaper.GetActiveTake = function(it) if (it.curtake or 0) == 0 then return it end return it.takes[it.curtake] end
+reaper.SetActiveTake = function(take)
+  for _, t in ipairs(tracks) do
+    for _, it in ipairs(t.items) do
+      if it == take then it.curtake = 0 end
+      for k, x in ipairs(it.takes or {}) do if x == take then it.curtake = k end end
+    end
+  end
+end
+reaper.TakeIsMIDI = function(take) return not take.audio end
+reaper.GetSetMediaItemTakeInfo_String = function(take, key, v, set)
+  if key == "P_NAME" then if set then take.take_name = v end return true, take.take_name or "" end
+  return false, ""
+end
+reaper.GetMediaItemTake_Source = function(take) return take.audio and { file = take.audio } or nil end
+reaper.GetMediaSourceFileName = function(src) return src.file end
+reaper.GetMediaItemTakeInfo_Value = function(take, key)
+  if key == "D_PLAYRATE" then return take.rate or 1 end
+  if key == "D_STARTOFFS" then return take.offs or 0 end
+  return 0
+end
+reaper.SetMediaItemTakeInfo_Value = function(take, key, v)
+  if key == "D_STARTOFFS" then take.offs = v end
+  return true
+end
+reaper.SplitMediaItem = function(it, t)
+  if t <= it.position or t >= it.position + it.length then return nil end
+  local tr = track_of(it)
+  local right = new_item(t, it.position + it.length - t)
+  right.offs = (it.offs or 0) + (t - it.position)
+  it.length = t - it.position
+  tr.items[#tr.items + 1] = right
+  sort_items(tr)
+  fake_changed = true
+  return right
+end
+reaper.DeleteTrackMediaItem = function(t, it)
+  for i, x in ipairs(t.items) do if x == it then table.remove(t.items, i) fake_changed = true return true end end
+  return false
+end
+reaper.MoveMediaItemToTrack = function(it, dest)
+  local src, i = track_of(it)
+  table.remove(src.items, i)
+  dest.items[#dest.items + 1] = it
+  sort_items(dest)
+  fake_changed = true
+  return true
+end
+local chunk_src, guid_seq = {}, 0
+reaper.genGuid = function() guid_seq = guid_seq + 1 return ("{%08X-0000-0000-0000-000000000000}"):format(guid_seq) end
+reaper.GetItemStateChunk = function(it)
+  chunk_src[#chunk_src + 1] = it
+  return true, ("<ITEM\nSRC %d\nIGUID {AAAAAAAA-0000-0000-0000-000000000001}\n>"):format(#chunk_src)
+end
+reaper.AddMediaItemToTrack = function(t)
+  local it = new_item(0, 0)
+  t.items[#t.items + 1] = it
+  fake_changed = true
+  return it
+end
+reaper.SetItemStateChunk = function(it, chunk)
+  local src = chunk_src[tonumber(chunk:match("SRC (%d+)"))]
+  it.length, it.notes, it.chunk = src.length, src.notes, chunk
+  return true
+end
+reaper.MIDI_CountEvts = function(take) return #take.notes, #take.notes, #(take.ccs or {}), 0 end
+reaper.MIDI_GetCC = function(take, i)
+  local c = take.ccs[i + 1]
+  return true, c.sel or false, c.muted or false, c.ppq, c.chanmsg, c.chan, c.msg2, c.msg3
+end
+-- markers for goto: { pos, name, idx }
+reaper.EnumProjectMarkers = function(i)
+  local m = markers[i + 1]
+  if not m then return 0, false, 0, 0, "", 0 end
+  return i + 1, m.isrgn or false, m.pos or 0, m.rgnend or 0, m.name or "", m.idx or i
+end

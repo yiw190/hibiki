@@ -45,6 +45,15 @@ local RESP = DIR .. "response.json"
 local TMP = DIR .. "response.tmp"
 local HEART = DIR .. "heartbeat"
 local BUSY = DIR .. "busy"
+-- one id per REAPER process (non-persistent ExtState), so a bridge reloaded into the same REAPER keeps it; a
+-- second REAPER gets another and leaves the mailbox alone while the first one's heartbeat is fresh
+local INSTANCE = reaper.GetExtState("reaper_mcp", "instance")
+if INSTANCE == "" then
+  INSTANCE = ("%x%08x%04x"):format(os.time(), math.floor((reaper.time_precise() % 1) * 0xFFFFFFFF),
+    math.random(0, 0xFFFF))
+  reaper.SetExtState("reaper_mcp", "instance", INSTANCE, false)
+end
+local CLAIM = DIR .. "request." .. INSTANCE .. ".claimed"
 
 ----------------------------------------------------------------------
 -- JSON
@@ -293,7 +302,16 @@ local function touch_heartbeat(force)
   if not force and (now - last_heartbeat) < HEARTBEAT_INTERVAL then return end
   last_heartbeat = now
   local f = io.open(HEART, "wb")
-  if f then f:write(tostring(now)) f:close() end
+  if f then f:write(INSTANCE .. " " .. os.time()) f:close() end
+end
+
+-- another REAPER's bridge wrote the heartbeat within the last few seconds (server.py's stale limit is 5 s)
+local function other_bridge_alive()
+  local f = io.open(HEART, "rb")
+  if not f then return false end
+  local inst, t = (f:read("*a") or ""):match("^(%S+) (%d+)$")
+  f:close()
+  return inst ~= nil and inst ~= INSTANCE and os.time() - tonumber(t) <= 5
 end
 
 ----------------------------------------------------------------------
@@ -340,6 +358,7 @@ local function time_to_beats(t) return reaper.TimeMap2_timeToQN(0, t or 0) end
 
 local dispatch
 local DSL = {}
+local RUN_LUA_TIMEOUT = 10 -- seconds, when the request names none (server.py sends its own)
 local MIDI_FUNCS = {
   add_midi_notes = true, replace_midi_notes = true,
   update_midi_note = true, delete_midi_notes = true,
@@ -413,6 +432,8 @@ function DSL.ping()
   return { ret = { pong = true, version = VERSION, reaper = reaper.GetAppVersion() } }
 end
 
+local MAX_SELECTED_ITEMS = 200
+
 function DSL.get_project_summary(detail)
   local n = reaper.CountTracks(0)
   local tracks = {}
@@ -426,6 +447,7 @@ function DSL.get_project_summary(detail)
       item_count = reaper.CountTrackMediaItems(t),
       fx_count = reaper.TrackFX_GetCount(t),
     }
+    if reaper.IsTrackSelected(t) then rec.selected = true end
     if detail then
       local has_midi, has_audio, midi_notes = false, false, 0
       for j = 0, rec.item_count - 1 do
@@ -459,6 +481,20 @@ function DSL.get_project_summary(detail)
     master_mute = reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "B_MUTE") == 1,
   }
   if reaper.IsProjectDirty then ret.dirty = reaper.IsProjectDirty(0) ~= 0 end
+  ret.cursor_beats = time_to_beats(ret.cursor_seconds)
+  local ts, te = reaper.GetSet_LoopTimeRange2(0, false, false, 0, 0, false)
+  if te > ts then ret.time_selection = { start_beats = time_to_beats(ts), end_beats = time_to_beats(te) } end
+  local nsel = reaper.CountSelectedMediaItems(0)
+  if nsel > 0 then
+    local sel = {}
+    for i = 0, math.min(nsel, MAX_SELECTED_ITEMS) - 1 do
+      local it = reaper.GetSelectedMediaItem(0, i)
+      sel[#sel + 1] = { track_index = math.floor(reaper.GetMediaTrackInfo_Value(reaper.GetMediaItem_Track(it), "IP_TRACKNUMBER")) - 1,
+                        item_index = math.floor(reaper.GetMediaItemInfo_Value(it, "IP_ITEMNUMBER")) }
+    end
+    ret.selected_items = sel
+    if nsel > MAX_SELECTED_ITEMS then ret.selected_items_total = nsel end
+  end
   if detail then
     local num, denom = 4, 4
     if reaper.TimeMap_GetTimeSigAtTime then
@@ -468,9 +504,20 @@ function DSL.get_project_summary(detail)
     end
     local length_sec = 0
     if reaper.GetProjectLength then length_sec = reaper.GetProjectLength(0) or 0 end
-    ret.time_sig = { numerator = num, denominator = denom }
+    ret.time_sig = { numerator = num, denominator = denom } -- at the project start; tempo_map lists the changes
     ret.length_beats = time_to_beats(length_sec)
-    ret.cursor_beats = time_to_beats(ret.cursor_seconds)
+    local nt = reaper.CountTempoTimeSigMarkers(0)
+    if nt > 0 then
+      local map = {}
+      for i = 0, nt - 1 do
+        local _, tpos, _, _, bpm, tnum, tden, linear = reaper.GetTempoTimeSigMarker(0, i)
+        local m = { beats = time_to_beats(tpos), bpm = bpm }
+        if tnum and tnum > 0 then m.numerator, m.denominator = tnum, tden end
+        if linear then m.linear = true end
+        map[#map + 1] = m
+      end
+      ret.tempo_map = map
+    end
     local markers = {}
     local nm = 0
     if reaper.CountProjectMarkers then nm = reaper.CountProjectMarkers(0) or 0 end
@@ -549,15 +596,39 @@ function DSL.set_time_signature(num, denom)
   return { ret = { num = num, denom = denom } }
 end
 
-function DSL.transport(action)
+-- a marker or region by its number (as REAPER shows it) or its name; regions give their start
+local function marker_time(m)
+  local want = tostring(m):lower()
+  local i = 0
+  while true do
+    local retval, _, pos, _, name, num = reaper.EnumProjectMarkers(i)
+    if not retval or retval == 0 then break end
+    if (type(m) == "number" and num == m) or (type(m) ~= "number" and (name or ""):lower() == want) then return pos end
+    i = i + 1
+  end
+  error("no marker or region " .. (type(m) == "number" and "#" .. m or ("named " .. tostring(m))), 0)
+end
+
+function DSL.transport(action, opts)
   local cmds = {
     play = 1007, stop = 1016, pause = 1008, record = 1013,
     toggle_repeat = 1068, goto_start = 40042,
   }
-  local cmd = cmds[action]
-  if not cmd then error("unknown transport action: " .. tostring(action)) end
-  reaper.Main_OnCommand(cmd, 0)
-  return { ret = { play_state = reaper.GetPlayState(), position = reaper.GetPlayPosition() } }
+  if action == "goto" then
+    opts = opts or {}
+    local t
+    if opts.position_beats ~= nil then t = beats_to_time(opts.position_beats)
+    elseif opts.marker ~= nil then t = marker_time(opts.marker)
+    else error("goto needs position_beats or marker", 0) end
+    reaper.SetEditCurPos(t, true, true) -- moves the view, and playback when playing
+  else
+    local cmd = cmds[action]
+    if not cmd then error("unknown transport action: " .. tostring(action)) end
+    reaper.Main_OnCommand(cmd, 0)
+  end
+  local state = reaper.GetPlayState()
+  local pos = (state & 1) == 1 and reaper.GetPlayPosition() or reaper.GetCursorPosition()
+  return { ret = { play_state = state, position_sec = pos, position_beats = time_to_beats(pos) } }
 end
 
 function DSL.action(command_id)
@@ -683,6 +754,26 @@ function DSL.get_midi_notes(ti, ii)
   return { ret = notes }
 end
 
+-- CC, program change and pitch bend, in the shape `midi cc` takes (pitch_bend -8192..8191)
+function DSL.get_midi_cc(ti, ii)
+  local take = midi_take_at(ti, ii)
+  local _, _, ccCount = reaper.MIDI_CountEvts(take)
+  local out = {}
+  for i = 0, (ccCount or 0) - 1 do
+    local _, sel, muted, ppq, chanmsg, chan, m2, m3 = reaper.MIDI_GetCC(take, i)
+    local e = { start_beats = reaper.MIDI_GetProjQNFromPPQPos(take, ppq) }
+    if chanmsg == 0xB0 then e.cc, e.value = m2, m3
+    elseif chanmsg == 0xC0 then e.program = m2
+    elseif chanmsg == 0xE0 then e.pitch_bend = ((m3 << 7) | m2) - 8192
+    else e.status, e.msg2, e.msg3 = chanmsg, m2, m3 end
+    if chan ~= 0 then e.channel = chan end
+    if muted then e.muted = true end
+    if sel then e.selected = true end
+    out[#out + 1] = e
+  end
+  return { ret = out }
+end
+
 function DSL.replace_midi_notes(ti, ii, notes)
   local take = midi_take_at(ti, ii)
   validate_notes(notes)
@@ -797,14 +888,17 @@ function DSL.list_track_fx(ti)
   return { ret = out }
 end
 
-function DSL.get_fx_params(ti, fxi)
+function DSL.get_fx_params(ti, fxi, filter)
   local t = track_at(ti)
   local out = {}
+  local want = type(filter) == "string" and filter ~= "" and filter:lower() or nil
   for i = 0, reaper.TrackFX_GetNumParams(t, fxi) - 1 do
     local _, pn = reaper.TrackFX_GetParamName(t, fxi, i, "")
+    if want and not pn:lower():find(want, 1, true) then goto continue end
     local val, mn, mx = reaper.TrackFX_GetParam(t, fxi, i)
     local _, fmt = reaper.TrackFX_GetFormattedParamValue(t, fxi, i, "")
     out[#out + 1] = { index = i, name = pn, value = val, min = mn, max = mx, formatted = fmt }
+    ::continue::
   end
   return { ret = out }
 end
@@ -1024,6 +1118,28 @@ function DSL.update_send(ti, send_index, props)
   return { ret = true }
 end
 
+-- REAPER's C_FADEINSHAPE / C_FADEOUTSHAPE numbers
+local FADE_SHAPES = { "linear", "fast_start", "fast_end", "fast_start_steep", "fast_end_steep", "s_curve", "s_curve_steep" }
+local FADE_SHAPE_N = {}
+for i, n in ipairs(FADE_SHAPES) do FADE_SHAPE_N[n] = i - 1 end
+
+local function fade_shape(v)
+  local n = FADE_SHAPE_N[v]
+  if not n then error("fade shape must be one of " .. table.concat(FADE_SHAPES, ", "), 0) end
+  return n
+end
+
+local function item_at(ti, ii)
+  local item = reaper.GetTrackMediaItem(track_at(ti), ii)
+  if not item then error("no item at index " .. tostring(ii), 0) end
+  return item
+end
+
+local function item_index(item) return math.floor(reaper.GetMediaItemInfo_Value(item, "IP_ITEMNUMBER")) end
+local function item_track_index(item)
+  return math.floor(reaper.GetMediaTrackInfo_Value(reaper.GetMediaItem_Track(item), "IP_TRACKNUMBER")) - 1
+end
+
 function DSL.list_items(ti)
   local t = track_at(ti)
   local out = {}
@@ -1033,33 +1149,81 @@ function DSL.list_items(ti)
     local db = (vol <= 0) and -150 or (20 * math.log(vol) / math.log(10))
     local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
     local pos_beats = time_to_beats(pos)
-    out[#out + 1] = {
+    local rec = {
       item_index = i,
       position_beats = pos_beats,
       length_beats = time_to_beats(pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
         - pos_beats,
       gain_db = db,
-      fade_in = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
-      fade_out = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
+      fade_in_sec = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
+      fade_out_sec = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
       loop = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1,
       mute = reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1,
     }
+    local si, so = reaper.GetMediaItemInfo_Value(item, "C_FADEINSHAPE"), reaper.GetMediaItemInfo_Value(item, "C_FADEOUTSHAPE")
+    if si ~= 0 then rec.fade_in_shape = FADE_SHAPES[si + 1] end
+    if so ~= 0 then rec.fade_out_shape = FADE_SHAPES[so + 1] end
+    local nt = reaper.CountTakes(item)
+    local take = reaper.GetActiveTake(item)
+    if take then
+      local _, tname = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+      if tname ~= "" then rec.take = tname end
+      if not reaper.TakeIsMIDI(take) then
+        local src = reaper.GetMediaItemTake_Source(take)
+        local file = src and reaper.GetMediaSourceFileName(src, "") or ""
+        if file ~= "" then rec.source = file end
+      end
+    end
+    if nt > 1 then
+      rec.takes = nt
+      rec.active_take = math.floor(reaper.GetMediaItemInfo_Value(item, "I_CURTAKE"))
+    end
+    out[#out + 1] = rec
   end
   return { ret = out }
 end
 
+-- every take's start offset moves with the left edge, so the content stays where it is on the timeline
+local function set_left_edge(item, beats)
+  local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+  local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local new = beats_to_time(beats)
+  if new >= pos + len then error("left_edge_beats must stay before the item's end", 0) end
+  local d = new - pos
+  for k = 0, reaper.CountTakes(item) - 1 do
+    local take = reaper.GetTake(item, k)
+    if take then
+      local rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+      local offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+      reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", offs + d * (rate ~= 0 and rate or 1))
+    end
+  end
+  reaper.SetMediaItemInfo_Value(item, "D_POSITION", new)
+  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", len - d)
+end
+
 function DSL.update_item(ti, ii, props)
-  local item = reaper.GetTrackMediaItem(track_at(ti), ii)
-  if not item then error("no item at index " .. tostring(ii)) end
+  local item = item_at(ti, ii)
   props = props or {}
   if props.gain_db ~= nil then
     reaper.SetMediaItemInfo_Value(item, "D_VOL", 10 ^ (props.gain_db / 20))
   end
-  if props.fade_in ~= nil then
-    reaper.SetMediaItemInfo_Value(item, "D_FADEINLEN", props.fade_in)
+  if props.fade_in_sec ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "D_FADEINLEN", props.fade_in_sec)
   end
-  if props.fade_out ~= nil then
-    reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", props.fade_out)
+  if props.fade_out_sec ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", props.fade_out_sec)
+  end
+  if props.fade_in_shape ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "C_FADEINSHAPE", fade_shape(props.fade_in_shape))
+  end
+  if props.fade_out_shape ~= nil then
+    reaper.SetMediaItemInfo_Value(item, "C_FADEOUTSHAPE", fade_shape(props.fade_out_shape))
+  end
+  if props.active_take ~= nil then
+    local take = reaper.GetTake(item, props.active_take)
+    if not take then error("no take " .. tostring(props.active_take) .. " (the item has " .. reaper.CountTakes(item) .. ")", 0) end
+    reaper.SetActiveTake(take)
   end
   if props.loop ~= nil then
     reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", props.loop and 1 or 0)
@@ -1075,8 +1239,64 @@ function DSL.update_item(ti, ii, props)
     local pos_b = time_to_beats(pos)
     reaper.SetMediaItemLength(item, beats_to_time(pos_b + props.length_beats) - pos, false)
   end
+  if props.left_edge_beats ~= nil then set_left_edge(item, props.left_edge_beats) end
+  local ret = true
+  if props.dest_track_index ~= nil then
+    if not reaper.MoveMediaItemToTrack(item, track_at(props.dest_track_index)) then error("could not move the item", 0) end
+    ret = { track_index = item_track_index(item), item_index = item_index(item) }
+  end
   refresh_arrange()
-  return { ret = true }
+  return { ret = ret }
+end
+
+-- split at each beat position inside the item; the pieces left to right
+function DSL.split_item(ti, ii, at_beats)
+  local item = item_at(ti, ii)
+  if type(at_beats) ~= "table" or json.len(at_beats) == 0 then error("split needs at_beats", 0) end
+  local times = {}
+  for _, b in ipairs(at_beats) do times[#times + 1] = beats_to_time(b) end
+  table.sort(times)
+  local pieces = { item }
+  for _, t in ipairs(times) do
+    local last = pieces[#pieces]
+    local pos = reaper.GetMediaItemInfo_Value(last, "D_POSITION")
+    local len = reaper.GetMediaItemInfo_Value(last, "D_LENGTH")
+    if t <= pos or t >= pos + len then error(("beat %g is not inside the item"):format(time_to_beats(t)), 0) end
+    local right = reaper.SplitMediaItem(last, t)
+    if not right then error(("could not split at beat %g"):format(time_to_beats(t)), 0) end
+    pieces[#pieces + 1] = right
+  end
+  local out = {}
+  for _, it in ipairs(pieces) do out[#out + 1] = item_index(it) end
+  refresh_arrange()
+  return { ret = { item_indices = out } }
+end
+
+function DSL.delete_items(ti, indices)
+  local t = track_at(ti)
+  local list = {}
+  for _, i in ipairs(indices or {}) do list[#list + 1] = item_at(ti, i) end
+  if #list == 0 then error("delete needs item_index or item_indices", 0) end
+  for _, it in ipairs(list) do reaper.DeleteTrackMediaItem(t, it) end
+  refresh_arrange()
+  return { ret = { deleted = #list } }
+end
+
+-- an independent copy (new GUIDs, so a MIDI copy is not pooled with the original); default: right after the item
+function DSL.duplicate_item(ti, ii, opts)
+  local item = item_at(ti, ii)
+  opts = opts or {}
+  local dest = track_at(opts.dest_track_index or ti)
+  local ok, chunk = reaper.GetItemStateChunk(item, "", false)
+  if not ok then error("could not read the item", 0) end
+  chunk = chunk:gsub("{%x+%-%x+%-%x+%-%x+%-%x+}", function() return reaper.genGuid("") end)
+  local copy = reaper.AddMediaItemToTrack(dest)
+  reaper.SetItemStateChunk(copy, chunk, false)
+  local t = opts.position_beats ~= nil and beats_to_time(opts.position_beats)
+    or (reaper.GetMediaItemInfo_Value(item, "D_POSITION") + reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  reaper.SetMediaItemInfo_Value(copy, "D_POSITION", t)
+  refresh_arrange()
+  return { ret = { track_index = item_track_index(copy), item_index = item_index(copy) } }
 end
 
 function DSL.import_media(path, opts)
@@ -1167,14 +1387,27 @@ local function check_unit(unit)
   if unit ~= nil and unit ~= "gain" and unit ~= "db" then error("unit must be gain or db") end
 end
 
-function DSL.get_envelope(ti, name_or_index, unit)
+-- optional {start_beats, end_beats}: both ends included
+local function beat_range(range)
+  if type(range) ~= "table" or (range.start_beats == nil and range.end_beats == nil) then return nil end
+  local a, b = range.start_beats or 0, range.end_beats or math.huge
+  if b < a then error("end_beats must not be before start_beats", 0) end
+  return a, b
+end
+
+function DSL.get_envelope(ti, name_or_index, unit, range)
   check_unit(unit)
   local env = envelope_at(ti, name_or_index)
   local _, name = reaper.GetEnvelopeName(env, "")
   local mode = reaper.GetEnvelopeScalingMode(env)
+  local ra, rb = beat_range(range)
   local pts = {}
   for i = 0, reaper.CountEnvelopePoints(env) - 1 do
     local ok, time, value, shape, tension, selected = reaper.GetEnvelopePoint(env, i)
+    if ok and ra then
+      local b = time_to_beats(time)
+      if b < ra - 1e-9 or b > rb + 1e-9 then ok = false end
+    end
     if ok then
       pts[#pts + 1] = {
         beats = time_to_beats(time),
@@ -1201,18 +1434,27 @@ local function ensure_active(env)
   return true
 end
 
-function DSL.set_envelope(ti, name_or_index, points, unit)
+-- with a range only the points inside it are replaced (both ends included); without one, the whole envelope
+function DSL.set_envelope(ti, name_or_index, points, unit, range)
   check_unit(unit)
   local env = envelope_at(ti, name_or_index)
   local mode = reaper.GetEnvelopeScalingMode(env)
+  local ra, rb = beat_range(range)
   points = points or {}
   for i, p in ipairs(points) do
     if type(p) ~= "table" or type(p.beats or p.time) ~= "number" or type(p.value) ~= "number" then
       error("point #" .. i .. " needs numeric beats and value")
     end
     if p.beats and p.beats < 0 then error("point #" .. i .. " is before the project start (beats < 0)") end
+    if ra and p.beats and (p.beats < ra - 1e-9 or p.beats > rb + 1e-9) then
+      error(("point #%d (beat %g) is outside start_beats..end_beats"):format(i, p.beats), 0)
+    end
   end
-  reaper.DeleteEnvelopePointRange(env, -math.huge, math.huge)
+  if ra then
+    reaper.DeleteEnvelopePointRange(env, beats_to_time(ra) - 1e-9, rb == math.huge and math.huge or beats_to_time(rb) + 1e-9)
+  else
+    reaper.DeleteEnvelopePointRange(env, -math.huge, math.huge)
+  end
   for _, p in ipairs(points) do
     reaper.InsertEnvelopePoint(env, beats_to_time(p.beats or p.time or 0),
       reaper.ScaleToEnvelopeMode(mode, from_unit(p.value or 0, unit)), p.shape or 0, p.tension or 0,
@@ -1305,6 +1547,24 @@ local function measure_file(p)
 end
 
 local SILENT_PEAK_DB = -60
+-- REAPER sink configs (RENDER_FORMAT, base64): "evaw" + bit depth byte (32 = float), and LAME MP3 at 320 kbps CBR
+local RENDER_FORMATS = {
+  wav16 = "ZXZhdxAAAQ==", wav24 = "ZXZhdxgAAQ==", wav32 = "ZXZhdyAAAQ==",
+  mp3 = "bDNwbUABAAABAAAAAAAAAP////8EAAAAQAEAAAAAAAA=",
+}
+
+local function render_format(opts)
+  if opts.format == nil and opts.bit_depth == nil then return nil end
+  local f = opts.format or "wav"
+  if f == "mp3" then
+    if opts.bit_depth ~= nil then error("bit_depth is for wav", 0) end
+    return RENDER_FORMATS.mp3
+  end
+  if f ~= "wav" then error("format must be wav or mp3", 0) end
+  local cfg = RENDER_FORMATS["wav" .. tostring(opts.bit_depth or 24)]
+  if not cfg then error("bit_depth must be 16, 24 or 32 (float)", 0) end
+  return cfg
+end
 
 function DSL.render_project(path, opts)
   opts = opts or {}
@@ -1349,6 +1609,12 @@ function DSL.render_project(path, opts)
   if opts.pattern and opts.pattern ~= "" then
     reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", opts.pattern, true)
   end
+  -- a format asked for this render only: the project's own render format comes back afterwards
+  local fmt, fmt_before = render_format(opts), nil
+  if fmt then
+    fmt_before = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "", false))
+    reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", fmt, true)
+  end
 
   -- Temporary solo / mute for this render only (null tests, stage renders); restored afterwards.
   local snapshot
@@ -1367,6 +1633,7 @@ function DSL.render_project(path, opts)
     for _, i in ipairs(mute_list or {}) do reaper.SetMediaTrackInfo_Value(track_at(i), "B_MUTE", 1) end
   end
   local function restore()
+    if fmt_before then reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", fmt_before, true); fmt_before = nil end
     if not snapshot then return end
     for _, s in ipairs(snapshot) do
       if reaper.SetTrackUISolo then reaper.SetTrackUISolo(s.t, s.solo ~= 0 and 1 or 0, 3) end
@@ -1457,20 +1724,27 @@ function DSL.create_bus(name, source_indices)
   return { ret = { index = bus_index, name = name or "Bus" } }
 end
 
-function DSL.batch(calls)
+function DSL.batch(calls, opts)
   local results = {}
+  local stop = type(opts) == "table" and opts.stop_on_error
   batch_depth = batch_depth + 1
   local ok, err = pcall(function()
+    local failed = false
     for i = 1, json.len(calls or {}) do
-      local cok, r = pcall(dispatch, calls[i])
-      if not cok then
-        results[i] = { error = tostring(r) }
-      elseif r and r.ok == false then
-        results[i] = { error = r.error or "error" }
+      if failed then
+        results[i] = { skipped = true }
       else
-        results[i] = r and r.ret
+        local cok, r = pcall(dispatch, calls[i])
+        if not cok then
+          results[i] = { error = tostring(r) }
+        elseif r and r.ok == false then
+          results[i] = { error = r.error or "error" }
+        else
+          results[i] = r and r.ret
+        end
+        if results[i] == nil then results[i] = json.null end
+        failed = stop and type(results[i]) == "table" and results[i].error ~= nil
       end
-      if results[i] == nil then results[i] = json.null end
     end
   end)
   batch_depth = batch_depth - 1
@@ -1487,7 +1761,8 @@ end
 -- (ExtState Hibiki/turn while it waits for a reply); without one, calls less than 2 min apart share an id.
 ----------------------------------------------------------------------
 local READ_ONLY = {
-  ping = true, get_project_summary = true, list_tracks = true, get_midi_notes = true, list_track_fx = true,
+  ping = true, get_project_summary = true, list_tracks = true, get_midi_notes = true, get_midi_cc = true,
+  list_track_fx = true,
   get_fx_params = true, list_sends = true, list_items = true, list_envelopes = true, get_envelope = true,
   save_project = true, render_project = true, transport = true, set_time_selection = true, batch = true,
 }
@@ -1586,6 +1861,10 @@ local DESCRIBE = {
   delete_send = function(a) return ("%s: delete send %s"):format(tname(a[1]), a[2]) end,
   update_send = function(a) return ("%s send %s: %s"):format(tname(a[1]), a[2], props_text(a[3])) end,
   update_item = function(a) return ("%s item %s: %s"):format(tname(a[1]), a[2], props_text(a[3])) end,
+  split_item = function(a) return ("%s item %s: split at %d point%s"):format(tname(a[1]), a[2], count_of(a[3]),
+    count_of(a[3]) == 1 and "" or "s") end,
+  delete_items = function(a) return ("%s: delete %d item%s"):format(tname(a[1]), count_of(a[2]), count_of(a[2]) == 1 and "" or "s") end,
+  duplicate_item = function(a) return ("%s item %s: duplicate"):format(tname(a[1]), a[2]) end,
   import_media = function(a)
     local o = type(a[2]) == "table" and a[2] or {}
     return ("import %s%s"):format(short(tostring(a[1] or ""):match("[^/\\]+$") or a[1], 40),
@@ -1761,7 +2040,21 @@ dispatch = function(req)
       setmetatable({ reaper = reaper, json = json, to_handle = to_handle,
                      handles = handles }, { __index = _G }))
     if not chunk then return { ok = false, error = with_line(tidy_err(cerr), req.code) } end
+    -- past its timeout the snippet is stopped at the next Lua instruction; a call blocked inside REAPER or a
+    -- host command (ExecProcess, a render, a modal dialog) can't be interrupted and is stopped when it returns
+    local limit = tonumber(req.timeout) or RUN_LUA_TIMEOUT
+    local hook = debug and debug.sethook
+    if hook then
+      local deadline = reaper.time_precise() + limit
+      hook(function()
+        if reaper.time_precise() > deadline then
+          hook()
+          error(("run_lua stopped: still running after %g s (its timeout); what it did before that stays done"):format(limit), 0)
+        end
+      end, "", 10000)
+    end
     local ok, ret = pcall(chunk)
+    if hook then hook() end
     if not ok then return { ok = false, error = with_line(tidy_err(ret), req.code) } end
     return { ok = true, ret = ret }
   end
@@ -1797,13 +2090,46 @@ dispatch = function(req)
   return { ok = false, error = "unknown function: " .. tostring(func) }
 end
 
+local function batch_writes(req)
+  for _, c in ipairs(type(req.args) == "table" and type(req.args[1]) == "table" and req.args[1] or {}) do
+    if type(c) == "table" and (c.func == "run_lua" or c.func == "render_project" or receipt_wanted(tostring(c.func))) then
+      return true
+    end
+  end
+  return false
+end
+
+-- A reply works on the project tab that was in front when it first changed something. If the user brings another
+-- tab to the front meanwhile, writes (and renders) are refused instead of landing there. A panel reply stays
+-- refused until it ends; without the panel (calls < 2 min apart share a turn) the first refusal re-pins to the new
+-- tab, so the agent hears about the switch once and can go on there if that's what the user wants.
+local pin = nil -- { turn, proj, path }
+local function project_name(path) return (path ~= "" and path:match("[^/\\]+$")) or "an unsaved project" end
+local function guard_project(turn)
+  local proj, path = reaper.EnumProjects(-1, "")
+  if not pin or pin.turn ~= turn then pin = { turn = turn, proj = proj, path = path }; return end
+  if pin.proj == proj then return end
+  local was = pin.path
+  if not turn:match("^mcp%-") then
+    error(("refused: this reply started on %s, but %s is now the active project tab. Nothing was changed. "
+      .. "Ask the user to switch back to %s, or to send a new message for this tab."):format(
+      project_name(was), project_name(path), project_name(was)), 0)
+  end
+  pin = { turn = turn, proj = proj, path = path }
+  error(("refused once: earlier calls changed %s, but %s is now the active project tab. Nothing was changed. "
+    .. "If the user meant to switch, repeat the call; it will go to %s."):format(
+    project_name(was), project_name(path), project_name(path)), 0)
+end
+
 -- one undo block per request that can change something; its changes go on the turn's receipt. An empty block
 -- leaves no undo point, which is how a read-only run_lua stays off the receipt
 local function run_request(req)
   local func = req.func
+  if func == "render_project" then guard_project(current_turn()) end
   if func ~= "run_lua" and not receipt_wanted(func) and func ~= "batch" then return dispatch(req) end
-  staged = {}
   local turn = current_turn()
+  if func ~= "batch" or batch_writes(req) then guard_project(turn) end
+  staged = {}
   -- code we can't describe from its arguments (run_lua, raw API calls, a batch holding one): diff the project
   local opaque = func == "run_lua" or not DSL[func]
   if func == "batch" then
@@ -1853,17 +2179,27 @@ end
 -- Main loop
 ----------------------------------------------------------------------
 reaper.RecursiveCreateDirectory(DIR, 0)
-os.remove(REQ)
-os.remove(RESP)
-os.remove(TMP)
-os.remove(BUSY)
-touch_heartbeat()
-log("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR) -- no console window on every launch; `hibiki doctor` / ping report the version
+local serving = false
+local function start_serving()
+  serving = true
+  os.remove(REQ)
+  os.remove(RESP)
+  os.remove(TMP)
+  os.remove(BUSY)
+  touch_heartbeat(true)
+  log("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR) -- no console window on every launch; `hibiki doctor` / ping report the version
+end
+if other_bridge_alive() then
+  reaper.ShowConsoleMsg("reaper-mcp bridge: another REAPER is already serving the MCP; this one waits until it quits.\n")
+else
+  start_serving()
+end
 
 local function handle_mailbox()
-  local raw = read_file(REQ)
+  -- claim the request by renaming it: only one bridge can win, so a request never runs twice
+  local raw = os.rename(REQ, CLAIM) and read_file(CLAIM)
   if raw then
-    os.remove(REQ)
+    os.remove(CLAIM)
     local bf = io.open(BUSY, "wb")
     if bf then bf:write("1") bf:close() end
     touch_heartbeat(true)
@@ -1887,7 +2223,17 @@ local function handle_mailbox()
 end
 
 local tick_error_shown = false
+local next_check = 0
 local function tick()
+  if not serving then
+    local now = reaper.time_precise()
+    if now >= next_check then
+      next_check = now + 1
+      if not other_bridge_alive() then start_serving() end
+    end
+    reaper.defer(tick)
+    return
+  end
   touch_heartbeat()
   local ok, err = pcall(handle_mailbox)
   if not ok then
