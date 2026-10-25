@@ -1,6 +1,7 @@
 -- Hibiki studio: what the panel adds around the chat.
 --   receipts  each reply's REAPER changes (the bridge labels its undo points "Hibiki <turn>: …" and lists them in
---             ExtState Hibiki/receipts), shown as a card that reverts or redoes exactly that reply
+--             ExtState Hibiki/receipts); after a reply that changed the project a copy goes to Version history
+--             (Agent settings), where Go to brings back any version
 --   meter     Hibiki_Meter.jsfx on the master's monitoring FX writes 100 ms frames to gmem "Hibiki" while REAPER
 --             plays; the last playback becomes a few context lines (loudness, true peak, bands, stereo, per bar)
 --   rack      audition variants tagged by the agent (track P_EXT:hibiki_var = "group/n", or P_EXT:hibiki_fxvar
@@ -341,7 +342,7 @@ function RK.switch(g, n)
     if v.lane then
       reaper.SetMediaTrackInfo_Value(v.tr, 'C_LANEPLAYS:' .. v.lane, on and 1 or 0) -- no undo point (REAPER 7.79)
     elseif v.fx then
-      -- TrackFX_SetEnabled leaves an "FX bypass toggle" undo point (on top of the reply's, blocking Revert); the
+      -- TrackFX_SetEnabled leaves an "FX bypass toggle" undo point (on top of the reply's); the
       -- :bypass parameter switches the same thing without one (checked on REAPER 7.79), like B_MUTE
       local pb = reaper.TrackFX_GetParamFromIdent and reaper.TrackFX_GetParamFromIdent(v.tr, v.fx, ':bypass') or -1
       if pb >= 0 then reaper.TrackFX_SetParamNormalized(v.tr, v.fx, pb, on and 0 or 1)
@@ -722,6 +723,16 @@ function SV.save(title, lines, turn)
   if not P.WIN then -- compress, and keep the newest MAX_SNAPS, in the background
     P.sh('( /usr/bin/gzip -9 -f ' .. P.q(file) .. '; cd ' .. P.q(hd) .. ' && /bin/ls -t | /usr/bin/grep "\\.RPP\\.gz$" | '
       .. '/usr/bin/tail -n +' .. (MAX_SNAPS + 1) .. ' | while read f; do /bin/rm -f "$f"; done ) >/dev/null 2>&1 &')
+  else -- no gzip there: keep the newest MAX_SNAPS uncompressed (stamped names sort by time)
+    local names, i = {}, 0
+    while true do
+      local f = reaper.EnumerateFiles(hd, i)
+      if not f then break end
+      if f:match('^%d+%-%d+%.RPP$') then names[#names + 1] = f end
+      i = i + 1
+    end
+    table.sort(names)
+    for k = 1, #names - MAX_SNAPS do os.remove(hd .. SEP .. names[k]) end
   end
   SV.cache_key = nil
   SV.saved_at = reaper.GetProjectStateChangeCount(0) -- "Current" is in the history until the project changes again

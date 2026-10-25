@@ -1,7 +1,8 @@
 # Remote host (macOS + Cloudflare Tunnel)
 
 Only needed when the agent runs somewhere else (e.g. a cloud container) and has to reach REAPER on a Mac over the
-internet. Local MCP clients and the agent gateway talk to REAPER directly over stdio and don't need any of this.
+internet. The tunnel puts `run_lua` (Lua inside REAPER, and through it a shell on the Mac) on the internet behind
+one bearer: run it only while such an agent needs it, and put a Cloudflare Access policy in front of the hostname. Local MCP clients and the agent gateway talk to REAPER directly over stdio and don't need any of this.
 
 **Gamut desktop on the same Mac doesn't need it either.** `hibiki setup` (the .pkg or `install.sh`) runs
 `reaper_mcp/http_server.py` (bearer auth) and registers the MCP in Gamut as `http://localhost:8787/mcp`: Gamut desktop

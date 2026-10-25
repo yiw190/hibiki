@@ -196,7 +196,7 @@ Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and an agent: Ga
 on `127.0.0.1:47892`; for Gamut it uses the desktop app's local REST + SSE API (`127.0.0.1:47891`), the same one
 Gamut's own UI uses.
 
-The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua` and `panel/studio.lua` to `<REAPER resource path>/Scripts/Hibiki/`
+The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua`, `panel/context.lua`, `panel/markdown.lua` and `panel/studio.lua` to `<REAPER resource path>/Scripts/Hibiki/`
 (and `panel/Hibiki_Meter.jsfx` to `<REAPER resource path>/Effects/Hibiki/`), then **Actions → Load ReaScript** and run `Hibiki.lua`.
 2. Optional: run `panel/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
    binds **Cmd+L** to toggle it, and relaunches REAPER.
@@ -211,8 +211,10 @@ long ago it was set and, for time/razor ranges, the chord markers and what plays
 the same selections, newest first. Enter sends, Shift+Enter is a newline. Drag to select message text and Cmd+C to
 copy. Attach files with **+ File** or by dropping them on the panel: they're uploaded to the agent (Gamut's
 `upload-file`; for ACP agents the gateway stores them and sends images as image blocks) and listed in the message as
-`[Attached files:]`. When a Gamut agent asks a question or needs an approval, the panel jumps to that chat in Gamut
-(`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
+`[Attached files:]` (for Gamut, whose copies live in the agent's container, followed by the files' paths on the
+REAPER host, which `item import` needs). A Gamut agent's questions, secrets, script runs and approvals are answered in
+the panel; connecting an account or MCP server, uploading a requested file, a browser step or computer use opens that
+chat in Gamut (`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
 ReaImGui passes keys to both the IME and ImGui, so the panel undoes ImGui's half of Backspace / arrows / Esc / Enter
 while a composition is open and shows the pending pinyin under the input.
 
@@ -327,7 +329,8 @@ REAPER is busy or hung, and the watchdog restarts a hung one. `--json` prints `{
 
 - The HTTP front (`127.0.0.1:8787`) refuses to start with a bearer shorter than 32 characters; `hibiki setup` and
   `scripts/macos-host-bootstrap.sh` generate one with a CSPRNG when none is given.
-- Exposed through a Cloudflare tunnel, the bearer is the only gate. Put a Cloudflare Access policy (service token or
+- Exposed through a Cloudflare tunnel, the bearer is the only gate in front of `run_lua`, i.e. a shell on the Mac. Only
+  run the tunnel while an agent outside the Mac needs it, and put a Cloudflare Access policy (service token or
   identity) in front of the tunnel hostname so requests are filtered before they reach the Mac.
 
 ## Tools
@@ -341,8 +344,16 @@ Behaviour worth knowing (all optional parameters; older calls work unchanged):
 - `fx set` takes `formatted` instead of `value`: the value as the plugin shows it (`-18` for dB, `4` for 4:1, `inf`, or a label such as `3.2k`). It searches the display text and returns the `formatted` value it actually set.
 - `send add|update` take `mode` (`post_fader` / `pre_fader` / `pre_fx`) and `src_channel` / `dst_channel`, the first channel of a stereo pair counted from 0 (`dst_channel=2` = channels 3/4, a compressor's sidechain input). The destination track gets more channels if it needs them.
 - `envelope get|set` take `unit=db` for volume-type envelopes. `set` turns an inactive (`ACT 0`) envelope back on and rejects points that have no `value`.
-- `run_lua` takes `timeout` (seconds, at most 600). Errors quote the failing source line. REAPER is frozen while a snippet runs, so start long host commands in the background and poll their log.
-- Every call that can change the project is one undo point labelled `Hibiki <reply>: <what changed>` (a `batch` is one point for all its calls); see [Revert a reply](#around-the-chat-panelstudiolua).
+- `run_lua` takes `timeout` (seconds, default 10, at most 600). Errors quote the failing source line. REAPER is frozen while a snippet runs, so start long host commands in the background and poll their log.
+- Every call that can change the project is one undo point labelled `Hibiki <reply>: <what changed>` (a `batch` is one point for all its calls, with no rollback: `stop_on_error=true` skips the rest after a failure); see [Version history](#around-the-chat-panelstudiolua).
+- A reply works on the project tab that was in front when it first changed something: if another tab comes to the front, writes and renders are refused (from the panel, until the reply ends; without the panel the first refusal re-pins to the new tab).
+- `status` always returns `cursor_beats`, `time_selection`, selected tracks (`selected`) and `selected_items`; `detail=true` adds `tempo_map` (tempo and meter changes).
+- `item` arranges: `split` (`at_beats`), `delete`, `duplicate` (an unpooled copy), and `update` with `left_edge_beats` (trim the start, content stays put), `dest_track_index`, `active_take`, `fade_in_sec` / `fade_out_sec` and `fade_*_shape`. Item indices follow position, so list again after a move.
+- `envelope get|set` take `start_beats` / `end_beats`: `set` then replaces only the points in that range.
+- `transport goto` moves the edit cursor to `position_beats` or a marker/region (number or name); transport returns `position_sec` and `position_beats`.
+- `render` takes `format` (`wav` with `bit_depth` 16 / 24 / 32 float, or `mp3` at 320 kbps) for that render only. `fx params` takes `filter`; `midi get_cc` reads CC, program and pitch bend.
+- `run_lua`'s `timeout` stops a snippet that is still running Lua (what it did until then stays done); a call blocked inside REAPER (ExecProcess, a render, a dialog) can't be stopped.
+- One REAPER serves the mailbox: a second REAPER's bridge waits until the first one's heartbeat goes stale, and a request is claimed by renaming it, so it never runs twice.
 
 ## Tests
 
