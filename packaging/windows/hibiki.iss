@@ -39,7 +39,7 @@ Source: "{#Stage}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs i
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath(ExpandConstant('{app}\bin'))
 
 [UninstallRun]
-Filename: "{app}\python\python.exe"; Parameters: "-s -E ""{app}\app\reaper_mcp\cli.py"" uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "HibikiUninstall"
+Filename: "{app}\python\HibikiConsole.exe"; Parameters: "-s -E ""{app}\app\reaper_mcp\cli.py"" uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "HibikiUninstall"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -71,7 +71,7 @@ begin
       'open REAPER once, then run this installer again.', mbCriticalError, MB_OK, IDOK);
 end;
 
-{ an upgrade replaces python.exe and friends: stop the running supervisor (and its children) first }
+{ an upgrade replaces the Hibiki*.exe and python*.exe files: stop the running supervisor (and its children) first }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Pid: AnsiString;
@@ -92,7 +92,7 @@ begin
     Log := ExpandConstant('{localappdata}\Hibiki\logs\install.log');
     ForceDirectories(ExtractFileDir(Log));
     { HIBIKI_USE_RELEASE: a fresh install leaves `hibiki use dev` and sets everything up from the package }
-    if not Exec(ExpandConstant('{cmd}'), '/C "set HIBIKI_USE_RELEASE=1&& "' + ExpandConstant('{app}\python\python.exe') + '" -s -E "' +
+    if not Exec(ExpandConstant('{cmd}'), '/C "set HIBIKI_USE_RELEASE=1&& "' + ExpandConstant('{app}\python\HibikiConsole.exe') + '" -s -E "' +
         ExpandConstant('{app}\app\reaper_mcp\cli.py') + '" setup > "' + Log + '" 2>&1"', '', SW_HIDE,
         ewWaitUntilTerminated, Rc) or (Rc <> 0) then
       SuppressibleMsgBox('Hibiki setup did not finish (exit code ' + IntToStr(Rc) + '). Details: ' + Log, mbError, MB_OK, IDOK);

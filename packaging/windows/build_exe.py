@@ -14,6 +14,7 @@ import hashlib
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -27,6 +28,11 @@ SUITE = ["reaper_mcp", "brain", "gateway", "panel", "reaper", "LICENSE", "README
 # nothing in the suite uses these; ~30 MB less
 PRUNE = ["tcl", "include", "libs", "Scripts", "Lib/test", "Lib/idlelib", "Lib/turtledemo", "Lib/tkinter",
          "Lib/ensurepip", "Lib/lib2to3", "Lib/site-packages/pip"]
+
+
+# electron/rcedit: sets the icon and version strings of the Hibiki*.exe copies
+RCEDIT = ("https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe",
+          "3e7801db1a5edbec91b49a24a094aad776cb4515488ea5a4ca2289c400eade2a")
 
 
 def lock() -> dict:
@@ -43,21 +49,26 @@ def numeric(v: str) -> str:
     return ".".join(parts) + ".0"
 
 
+def download(url: str, sha256: str) -> Path:
+    cache = Path(os.environ.get("PY_CACHE") or Path.home() / ".cache/hibiki")
+    cache.mkdir(parents=True, exist_ok=True)
+    f = cache / url.rsplit("/", 1)[1]
+    if not f.exists():
+        with urllib.request.urlopen(url, timeout=300) as r:
+            f.with_name(f.name + ".part").write_bytes(r.read())
+        os.replace(f.with_name(f.name + ".part"), f)
+    got = hashlib.sha256(f.read_bytes()).hexdigest()
+    if got != sha256:
+        f.unlink()
+        raise SystemExit("sha256 mismatch for %s: %s" % (f.name, got))
+    return f
+
+
 def fetch_python(stage: Path) -> None:
     L = lock()
     name = "cpython-%s+%s-x86_64-pc-windows-msvc-install_only_stripped.tar.gz" % (L["PY"], L["TAG"])
-    cache = Path(os.environ.get("PY_CACHE") or Path.home() / ".cache/hibiki")
-    cache.mkdir(parents=True, exist_ok=True)
-    tgz = cache / name
-    if not tgz.exists():
-        url = "https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s" % (L["TAG"], name)
-        with urllib.request.urlopen(url, timeout=300) as r:
-            tgz.with_name(name + ".part").write_bytes(r.read())
-        os.replace(tgz.with_name(name + ".part"), tgz)
-    got = hashlib.sha256(tgz.read_bytes()).hexdigest()
-    if got != L["SHA_win_x64"]:
-        tgz.unlink()
-        raise SystemExit("sha256 mismatch for %s: %s" % (name, got))
+    tgz = download("https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s" % (L["TAG"], name),
+                   L["SHA_win_x64"])
     with tempfile.TemporaryDirectory() as tmp:
         with tarfile.open(tgz) as t:
             if hasattr(tarfile, "data_filter"):
@@ -72,6 +83,35 @@ def fetch_python(stage: Path) -> None:
             dll.unlink()
 
 
+def make_ico(out: Path) -> None:
+    """A .ico whose entries are the PNG icons as they are (Windows reads PNG entries since Vista)."""
+    pngs = [(s, (REPO / ("icons/hibiki-%d.png" % s)).read_bytes()) for s in (16, 32, 64, 128, 256)]
+    head = struct.pack("<HHH", 0, 1, len(pngs))
+    offset, entries = 6 + 16 * len(pngs), b""
+    for size, data in pngs:
+        entries += struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    out.write_bytes(head + entries + b"".join(d for _, d in pngs))
+
+
+def brand(stage: Path) -> None:
+    """Hibiki.exe (from pythonw.exe: the supervisor, no console) and HibikiConsole.exe (from python.exe: services and
+    the CLI). Task Manager and Startup apps show an exe's icon and FileDescription, so they say Hibiki, not Python."""
+    py, v = stage / "python", version()
+    ico = stage.parent / "hibiki.ico"
+    make_ico(ico)
+    rcedit = download(*RCEDIT)
+    for src, dst in (("pythonw.exe", "Hibiki.exe"), ("python.exe", "HibikiConsole.exe")):
+        shutil.copy2(py / src, py / dst)
+        args = [str(rcedit), str(py / dst), "--set-icon", str(ico), "--set-file-version", numeric(v),
+                "--set-product-version", v]
+        for k, val in (("FileDescription", "Hibiki"), ("ProductName", "Hibiki"), ("CompanyName", "yiw190"),
+                       ("InternalName", dst[:-4]), ("OriginalFilename", dst)):
+            args += ["--set-version-string", k, val]
+        subprocess.run(args, check=True)
+    ico.unlink()
+
+
 def stage_suite(stage: Path) -> None:
     app = stage / "app"
     for rel in SUITE:
@@ -84,7 +124,7 @@ def stage_suite(stage: Path) -> None:
     (stage / "bin").mkdir()
     # %~dp0 = this file's folder; -s -E: ignore the user's site-packages and PYTHON* variables
     (stage / "bin/hibiki.cmd").write_text(
-        '@echo off\r\n"%~dp0..\\python\\python.exe" -s -E "%~dp0..\\app\\reaper_mcp\\cli.py" %*\r\n')
+        '@echo off\r\n"%~dp0..\\python\\HibikiConsole.exe" -s -E "%~dp0..\\app\\reaper_mcp\\cli.py" %*\r\n')
     (stage / "VERSION").write_text(version() + "\n")
 
 
@@ -101,8 +141,9 @@ def main() -> int:
     if os.name != "nt":
         print("staged in %s (bytecode and installer need Windows)" % stage)
         return 0
+    brand(stage)
     # the install folder is per user but treat it as read-only: ship the bytecode
-    subprocess.run([str(stage / "python/python.exe"), "-m", "compileall", "-q", str(stage / "app")], check=True)
+    subprocess.run([str(stage / "python/HibikiConsole.exe"), "-m", "compileall", "-q", str(stage / "app")], check=True)
     iscc = os.environ.get("ISCC") or shutil.which("ISCC") or r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
     subprocess.run([iscc, "/Q", "/DAppVersion=" + v, "/DNumVersion=" + numeric(v), "/DStage=" + str(stage),
                     "/DOutDir=" + str(out), str(HERE / "hibiki.iss")], check=True)

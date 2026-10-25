@@ -530,9 +530,12 @@ def watchdog_off(p: Paths) -> None:
 # restarts them when they exit; HKCU ...\CurrentVersion\Run starts it at logon. No admin rights, no Task Scheduler.
 
 def win_python(gui: bool = False) -> str:
+    """The package's Hibiki.exe / HibikiConsole.exe (branded python copies), else pythonw.exe / python.exe."""
     exe = Path(sys.executable)
-    cand = exe.with_name("pythonw.exe" if gui else "python.exe")
-    return str(cand) if cand.exists() else str(exe)
+    for name in ("Hibiki.exe", "pythonw.exe") if gui else ("HibikiConsole.exe", "python.exe"):
+        if exe.with_name(name).exists():
+            return str(exe.with_name(name))
+    return str(exe)
 
 
 def supervisor_cmd() -> list:
@@ -551,7 +554,7 @@ def win_supervisor_pid(p: Paths) -> int:
         return 0
     out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
                          capture_output=True, text=True).stdout.lower()
-    return pid if "python" in out else 0  # a reused PID belongs to someone else
+    return pid if "python" in out or "hibiki" in out else 0  # a reused PID belongs to someone else
 
 
 def win_autostart() -> str:
@@ -891,7 +894,8 @@ def pkg_root() -> Path:
 
 def pkg_python() -> Path:
     if WINDOWS:
-        return pkg_root() / "python/python.exe"
+        exe = pkg_root() / "python/HibikiConsole.exe"
+        return exe if exe.exists() else pkg_root() / "python/python.exe"  # packages before 0.6.0
     app = pkg_root() / "python/Hibiki.app/Contents/MacOS/Hibiki"
     return app if app.exists() else pkg_root() / "python/bin/python3"  # packages before 0.6.0 have no Hibiki.app
 

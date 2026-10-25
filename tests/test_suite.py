@@ -703,6 +703,23 @@ def check_app_bundle(check, suite):
         r = subprocess.run([sys.executable] + args[1:], capture_output=True, text=True, timeout=20)
         check("app: watchdog starts as Hibiki and execs bash on the script",
               args[0] == str(exe) and args[-1] == str(script) and r.stdout.startswith("bash "), r.stdout + r.stderr)
+
+        d = home / "win"
+        d.mkdir()
+        for n in ("python.exe", "pythonw.exe"):
+            (d / n).write_text("")
+        exe_saved = sys.executable
+        sys.executable = str(d / "python.exe")
+        try:
+            old = suite.win_python(), suite.win_python(gui=True)
+            for n in ("HibikiConsole.exe", "Hibiki.exe"):
+                (d / n).write_text("")
+            new = suite.win_python(), suite.win_python(gui=True)
+        finally:
+            sys.executable = exe_saved
+        check("app: Windows prefers HibikiConsole.exe / Hibiki.exe, falls back to python.exe / pythonw.exe",
+              old == (str(d / "python.exe"), str(d / "pythonw.exe"))
+              and new == (str(d / "HibikiConsole.exe"), str(d / "Hibiki.exe")), str((old, new)))
     finally:
         suite.PKG_ROOT, suite.no_launchd, suite.WINDOWS = saved
 
