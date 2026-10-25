@@ -1315,6 +1315,25 @@ def test_rack_keep():
     check("rack: the row is gone after Keep", len(p.lua_list(p.m.studio._RK.groups)) == 0)
 
 
+def test_rack_keep_layered_variant():
+    p = studio_panel()
+    p.lua.execute("""
+      TRACKS = { { name = 'Synths', ext = { hibiki_var = 'Synth/1' }, mute = 1 },
+                 { name = 'Synth Body', ext = { hibiki_var = 'Synth/3' }, mute = 0 },
+                 { name = 'Synth Air', ext = { hibiki_var = 'Synth/3' }, mute = 0 },
+                 { name = 'Synth Bell', ext = { hibiki_var = 'Synth/3' }, mute = 0 },
+                 { name = 'Synth Imit', ext = { hibiki_var = 'Synth/2' }, mute = 1 } }
+      reaper.DeleteTrack = function(t) for i, x in ipairs(TRACKS) do if x == t then table.remove(TRACKS, i) end end end
+      RET.InvisibleButton = function(_, id) return id == '##chip_rkkeep1' end""")
+    p.m.studio.tick(5000)
+    p.m.studio.rack_row()
+    p.lua.execute("RET.InvisibleButton = nil")
+    t = p.lua_list(p.lua.globals().TRACKS)
+    check("rack: Keep 3 of a 3-track stack keeps every layer, untagged and playing",
+          [x.name for x in t] == ["Synth Body", "Synth Air", "Synth Bell"]
+          and all((x.ext.hibiki_var or "") == "" and x.mute == 0 for x in t),
+          [(x.name, x.ext.hibiki_var, x.mute) for x in t])
+
 
 def test_rack_lanes():
     p = studio_panel()

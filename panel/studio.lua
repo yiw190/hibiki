@@ -366,46 +366,48 @@ function RK.switch(g, n)
     reaper.Main_OnCommand(1007, 0) -- Transport: Play
   end
 end
--- Keep n: the other variants go (tracks deleted / FX removed), the tags are cleared; one undo step
+-- Keep n: the other variants go (tracks deleted / FX removed), the tags are cleared; one undo step.
+-- A variant can span several tracks / FX tagged with the same number (a layered stack): all of them stay.
 function RK.keep(g, n)
   for _, v in ipairs(g.vars) do
     if reaper.ValidatePtr2(0, v.tr, 'MediaTrack*') == false then RK.at = -math.huge; return end
   end
-  local kept
   reaper.Undo_BeginBlock2(0)
   reaper.PreventUIRefresh(1)
-  local fx_drop, tr_drop = {}, {}
+  local kept, fx_drop, tr_drop = {}, {}, {}
   for _, v in ipairs(g.vars) do
-    if v.n == n then kept = v
+    if v.n == n then kept[#kept + 1] = v
     elseif v.lane then -- the lanes go together below
     elseif v.fx then fx_drop[#fx_drop + 1] = v
     else tr_drop[#tr_drop + 1] = v end
   end
-  if kept and kept.lane then -- the kept lane's items stay, the track goes back to one lane
-    for j = reaper.CountTrackMediaItems(kept.tr) - 1, 0, -1 do
-      local it = reaper.GetTrackMediaItem(kept.tr, j)
-      if reaper.GetMediaItemInfo_Value(it, 'I_FIXEDLANE') ~= kept.lane then reaper.DeleteTrackMediaItem(kept.tr, it) end
+  for _, k in ipairs(kept) do
+    if k.lane then -- the kept lane's items stay, the track goes back to one lane
+      for j = reaper.CountTrackMediaItems(k.tr) - 1, 0, -1 do
+        local it = reaper.GetTrackMediaItem(k.tr, j)
+        if reaper.GetMediaItemInfo_Value(it, 'I_FIXEDLANE') ~= k.lane then reaper.DeleteTrackMediaItem(k.tr, it) end
+      end
+      reaper.SetMediaTrackInfo_Value(k.tr, 'I_FREEMODE', 0)
+      reaper.GetSetMediaTrackInfo_String(k.tr, 'P_EXT:hibiki_lanes', '', true)
     end
-    reaper.SetMediaTrackInfo_Value(kept.tr, 'I_FREEMODE', 0)
-    reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_lanes', '', true)
   end
   table.sort(fx_drop, function(a, b) return a.fx > b.fx end) -- highest index first: the others keep their place
   for _, v in ipairs(fx_drop) do reaper.TrackFX_Delete(v.tr, v.fx) end
   for _, v in ipairs(tr_drop) do reaper.DeleteTrack(v.tr) end
-  if kept and not kept.lane then
-    if kept.fx then
-      local _, lines = reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_fxvar', '', false)
+  for _, k in ipairs(kept) do
+    if k.fx then
+      local _, lines = reaper.GetSetMediaTrackInfo_String(k.tr, 'P_EXT:hibiki_fxvar', '', false)
       local rest = {}
       for line in (lines or ''):gmatch('[^\n]+') do
         if line:match('^(.-)/%d+\t') ~= g.name then rest[#rest + 1] = line end
       end
-      reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_fxvar', table.concat(rest, '\n'), true)
-      for k = 0, reaper.TrackFX_GetCount(kept.tr) - 1 do -- the kept FX by GUID: deleting others moved its index
-        if reaper.TrackFX_GetFXGUID(kept.tr, k) == kept.guid then reaper.TrackFX_SetEnabled(kept.tr, k, true) end
+      reaper.GetSetMediaTrackInfo_String(k.tr, 'P_EXT:hibiki_fxvar', table.concat(rest, '\n'), true)
+      for j = 0, reaper.TrackFX_GetCount(k.tr) - 1 do -- the kept FX by GUID: deleting others moved its index
+        if reaper.TrackFX_GetFXGUID(k.tr, j) == k.guid then reaper.TrackFX_SetEnabled(k.tr, j, true) end
       end
-    else
-      reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_var', '', true)
-      reaper.SetMediaTrackInfo_Value(kept.tr, 'B_MUTE', 0)
+    elseif not k.lane then
+      reaper.GetSetMediaTrackInfo_String(k.tr, 'P_EXT:hibiki_var', '', true)
+      reaper.SetMediaTrackInfo_Value(k.tr, 'B_MUTE', 0)
     end
   end
   reaper.PreventUIRefresh(-1)
@@ -500,7 +502,7 @@ function M.rack_row()
     ImGui.SameLine(ctx, 0, 8)
     if P.chip('rkkeep' .. gi, keep and ('Keep ' .. keep.n) or 'Keep', C.muted, false, not keep) then RK.keep(g, keep.n) end
     if ImGui.IsItemHovered(ctx) then
-      P.show_tip(keep and (keep.label .. '\nremoves ' .. plural(#g.vars - 1, 'other variant') .. ' · one undo step')
+      P.show_tip(keep and (keep.label .. '\nremoves ' .. plural(g.count - 1, 'other variant') .. ' · one undo step')
         or 'No variant playing')
     end
   end
