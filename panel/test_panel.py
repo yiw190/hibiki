@@ -833,6 +833,20 @@ def test_window_tool_run_boundary():
           all(not p.S.msgs[i]._hl for i in range(152, 181)))
 
 
+def test_tool_label_one_line():
+    cmd = "cd \"/Volumes/SSD/REAPER project\" && python3 -I -c '\np=\"a.RPP\"\nfor ln in open(p):\n  s=ln.strip()'"
+    msgs = [{"type": "user", "id": "u1", "content": {"text": "q"}},
+            {"type": "assistant", "id": "a1", "content": {"text": "done"},
+             "toolCalls": [{"name": "mcp__reaper_mcp__run_lua"}, {"name": cmd}]}]
+    p = _loaded(0, msgs)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = True
+    _bottom(p, lay)
+    tl = list(p.S.msgs[2]._tl.values())
+    check("tool lane: a multi-line command title becomes one line", tl[0] == "run_lua" and tl[1].startswith("cd ")
+          and not any("\n" in x for x in tl), tl)
+
+
 def bench():
     """Per-frame Lua time and ImGui call count, HEAD panel vs this one (mock ImGui; Lua cost includes the mocks)."""
     import subprocess

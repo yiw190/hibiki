@@ -476,9 +476,11 @@ local function stream_start()
   st.pid = tonumber(out:match('%d+'))
 end
 
+-- one line: ACP agents title a call with the whole command, and a multi-line one drew over the reply below
 local function tool_label(name)
   if type(name) ~= 'string' then return 'tool' end
-  return (name:gsub('^mcp__[%w_-]-__', ''))
+  name = name:gsub('^mcp__[%w_-]-__', ''):gsub('%s+', ' '):match('^ *(.-) *$')
+  return name ~= '' and name or 'tool'
 end
 
 -- Gamut's agent deep link (SuperAgent src/main/agent-deep-link.ts) focuses the app on this exact session
