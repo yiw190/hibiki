@@ -1160,9 +1160,9 @@ function DSL.list_items(ti)
       loop = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1,
       mute = reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1,
     }
-    local si, so = reaper.GetMediaItemInfo_Value(item, "C_FADEINSHAPE"), reaper.GetMediaItemInfo_Value(item, "C_FADEOUTSHAPE")
-    if si ~= 0 then rec.fade_in_shape = FADE_SHAPES[si + 1] end
-    if so ~= 0 then rec.fade_out_shape = FADE_SHAPES[so + 1] end
+    -- a shape only matters on a fade that exists (new items carry REAPER's default shape, often not linear)
+    if rec.fade_in_sec > 0 then rec.fade_in_shape = FADE_SHAPES[reaper.GetMediaItemInfo_Value(item, "C_FADEINSHAPE") + 1] end
+    if rec.fade_out_sec > 0 then rec.fade_out_shape = FADE_SHAPES[reaper.GetMediaItemInfo_Value(item, "C_FADEOUTSHAPE") + 1] end
     local nt = reaper.CountTakes(item)
     local take = reaper.GetActiveTake(item)
     if take then

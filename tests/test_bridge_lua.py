@@ -683,7 +683,8 @@ def main() -> None:
     r = rpc("update_item", [0, 1, {"fade_in_shape": "wobbly"}])
     check("update: unknown fade shape lists the names", r.get("ok") is False and "s_curve" in r["error"], r)
     r = rpc("list_items", [0])["ret"]
-    check("list: fade_in_sec / shape named", r[1]["fade_in_sec"] == 0.2 and r[1]["fade_out_shape"] == "s_curve", r[1])
+    check("list: fade_in_sec and its shape; no shape on a fade that doesn't exist",
+          r[1]["fade_in_sec"] == 0.2 and r[1]["fade_in_shape"] == "linear" and "fade_out_shape" not in r[1], r[1])
     r = rpc("duplicate_item", [0, 0, {"position_beats": 20}])
     check("duplicate: copy lands at the beat with new GUIDs",
           r.get("ok") and r["ret"] == {"track_index": 0, "item_index": 3}
