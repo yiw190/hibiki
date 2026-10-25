@@ -118,9 +118,20 @@ jobs:
           Write-Host "tools: $n"
           if ($n -ne 14) { throw "expected 14 tools, got $n" }
           Invoke-RestMethod http://127.0.0.1:47892/health
-          $cl = (Get-CimInstance Win32_Process -Filter "Name='python.exe'").CommandLine -join "`n"
-          if ($cl -notmatch 'Programs\\Hibiki\\python') { throw "services aren't on the bundled Python: $cl" }
-          if (-not (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).Hibiki) { throw "no autostart" }
+          $procs = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$env:LOCALAPPDATA\Programs\Hibiki\*" })
+          $names = ($procs | ForEach-Object Name | Sort-Object) -join ","
+          $sup = @($procs | Where-Object Name -eq 'Hibiki.exe').Count
+          $svc = @($procs | Where-Object Name -eq 'HibikiConsole.exe').Count
+          $bare = @($procs | Where-Object Name -like 'python*').Count
+          if ($sup -ne 1 -or $svc -lt 2 -or $bare -ne 0) { throw "want the supervisor as Hibiki.exe, services as HibikiConsole.exe: $names" }
+          $run = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).Hibiki
+          if ($run -notmatch 'Programs\\Hibiki\\python\\Hibiki\.exe') { throw "autostart isn't Hibiki.exe: $run" }
+          foreach ($e in "Hibiki.exe", "HibikiConsole.exe") {
+            $vi = (Get-Item "$env:LOCALAPPDATA\Programs\Hibiki\python\$e").VersionInfo
+            if ($vi.FileDescription -ne "Hibiki" -or $vi.ProductName -ne "Hibiki") { throw "$e version info: $($vi | Out-String)" }
+          }
+          & "$env:LOCALAPPDATA\Programs\Hibiki\python\HibikiConsole.exe" -s -E -c "import ssl, sqlite3, ctypes, sys; print(sys.prefix)"
+          if ($LASTEXITCODE -ne 0) { throw "HibikiConsole.exe can't load the stdlib" }
       - name: supervisor restarts a service that dies
         run: |
           $owner = (Get-NetTCPConnection -LocalPort 8787 -State Listen).OwningProcess
