@@ -146,6 +146,7 @@ def main():
     check("MCP LaunchAgent runs reaper_mcp/http_server.py with this python",
           mcp["ProgramArguments"] == [sys.executable, str(ROOT / "reaper_mcp/http_server.py")], str(mcp))
     check("no secret in the MCP plist", OLD_BEARER not in (la / "com.hibiki.reaper-mcp.plist").read_text())
+    check("a python outside Hibiki.app: no bundle association", "AssociatedBundleIdentifiers" not in mcp, str(mcp))
     check("gateway LaunchAgent written", (la / "com.hibiki.agent-gateway.plist").exists())
     check("watchdog kept on (it was on before)", (la / "com.hibiki.reaper-watchdog.plist").exists())
     gw = json.loads((home / ".config/agent-gateway/config.json").read_text())
@@ -283,6 +284,7 @@ def main():
     check_stop_start(check, suite)
     check_update(check, suite)
     check_use(check, suite)
+    check_app_bundle(check, suite)
 
     httpd.shutdown()
     if failures:
@@ -664,6 +666,45 @@ def check_update(check, suite):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def check_app_bundle(check, suite):
+    """The package's Hibiki.app: pkg_python prefers it, LaunchAgents on it name the bundle, the watchdog starts as it."""
+    import contextlib
+    import io
+    home = Path(tempfile.mkdtemp(prefix="hb_app_"))
+    pkg = home / "pkg"
+    (pkg / "python/bin").mkdir(parents=True)
+    (pkg / "python/bin/python3").write_text("")
+    saved = suite.PKG_ROOT, suite.no_launchd, suite.WINDOWS
+    suite.PKG_ROOT, suite.no_launchd, suite.WINDOWS = pkg, (lambda: True), False
+    try:
+        check("app: a package without Hibiki.app keeps bin/python3", suite.pkg_python() == pkg / "python/bin/python3")
+        exe = pkg / "python/Hibiki.app/Contents/MacOS/Hibiki"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("")
+        check("app: pkg_python prefers Hibiki.app", suite.pkg_python() == exe, str(suite.pkg_python()))
+
+        p = suite.Paths()
+        p.la, p.logs = home / "LaunchAgents", home / "logs"
+        with contextlib.redirect_stdout(io.StringIO()):
+            suite.start_agent(p, "com.hibiki.test", [str(exe), "x.py"])
+            suite.start_agent(p, "com.hibiki.test2", ["/usr/bin/python3", "x.py"])
+        a = plistlib.loads((p.la / "com.hibiki.test.plist").read_bytes())
+        b = plistlib.loads((p.la / "com.hibiki.test2.plist").read_bytes())
+        check("app: a job on Hibiki.app names its bundle, a bare python doesn't",
+              a.get("AssociatedBundleIdentifiers") == [suite.APP_ID] and "AssociatedBundleIdentifiers" not in b, str(a))
+
+        check("app: watchdog outside the app runs bash directly",
+              suite.watchdog_args("/usr/bin/python3", "/w.sh") == ["/bin/bash", "/w.sh"])
+        script = home / "w.sh"
+        script.write_text('echo "bash $BASH_VERSION"\n')
+        args = suite.watchdog_args(str(exe), str(script))
+        r = subprocess.run([sys.executable] + args[1:], capture_output=True, text=True, timeout=20)
+        check("app: watchdog starts as Hibiki and execs bash on the script",
+              args[0] == str(exe) and args[-1] == str(script) and r.stdout.startswith("bash "), r.stdout + r.stderr)
+    finally:
+        suite.PKG_ROOT, suite.no_launchd, suite.WINDOWS = saved
 
 
 def check_use(check, suite):

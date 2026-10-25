@@ -249,6 +249,13 @@ def stop_agent(p: Paths, label: str, delete: bool = False) -> bool:
     return existed
 
 
+APP_ID = "io.github.yiw190.hibiki"
+
+
+def in_app(exe: str) -> bool:
+    return "/Hibiki.app/Contents/MacOS/" in exe
+
+
 def start_agent(p: Paths, label: str, args: list, env: dict | None = None, **extra) -> None:
     p.la.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
@@ -257,6 +264,8 @@ def start_agent(p: Paths, label: str, args: list, env: dict | None = None, **ext
             "StandardOutPath": log, "StandardErrorPath": log}
     if env:
         body["EnvironmentVariables"] = env
+    if in_app(args[0]):
+        body["AssociatedBundleIdentifiers"] = [APP_ID]
     body.update(extra)
     stop_agent(p, label)
     with open(p.plist(label), "wb") as f:
@@ -498,9 +507,16 @@ def start_gateway(p: Paths) -> None:
     say("  agent gateway on 127.0.0.1:%d: %s" % (GW_PORT, "up" if ok else "NOT answering, see %s" % (p.logs / "agent-gateway.log")))
 
 
+def watchdog_args(exe: str, script: str) -> list:
+    if not in_app(exe):
+        return ["/bin/bash", script]
+    # Login Items names a job after its program: start as Hibiki, then become bash
+    return [exe, "-s", "-E", "-c", "import os, sys; os.execv('/bin/bash', ['bash', sys.argv[1]])", script]
+
+
 def watchdog_on(p: Paths) -> None:
     script = need(ROOT / "scripts/reaper-watchdog.sh")
-    start_agent(p, WD_LABEL, ["/bin/bash", str(script)], StartInterval=30, ProcessType="Background")
+    start_agent(p, WD_LABEL, watchdog_args(sys.executable, str(script)), StartInterval=30, ProcessType="Background")
     say("  watchdog: on (relaunches REAPER after a crash, restarts a hung one while the Mac is idle)")
 
 
@@ -874,7 +890,10 @@ def pkg_root() -> Path:
 
 
 def pkg_python() -> Path:
-    return pkg_root() / ("python/python.exe" if WINDOWS else "python/bin/python3")
+    if WINDOWS:
+        return pkg_root() / "python/python.exe"
+    app = pkg_root() / "python/Hibiki.app/Contents/MacOS/Hibiki"
+    return app if app.exists() else pkg_root() / "python/bin/python3"  # packages before 0.6.0 have no Hibiki.app
 
 
 def pkg_cli() -> Path:

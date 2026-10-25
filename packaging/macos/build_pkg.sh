@@ -46,6 +46,24 @@ for arch in arm64 x86_64; do
     "$APP/python-$arch"/lib/tcl* "$APP/python-$arch"/lib/tk* "$APP/python-$arch/share"
 done
 
+# --- Hibiki.app: the Python binary inside an app bundle, so Login Items and privacy prompts name Hibiki, not python3.
+# Python finds its stdlib by walking up from Contents/MacOS to python-<arch>/lib; bin/python3.12 links to it.
+ICONSET="$WORK/Hibiki.iconset"
+mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+  cp "$REPO/icons/hibiki-$s.png" "$ICONSET/icon_${s}x${s}.png"
+  cp "$REPO/icons/hibiki-$((s * 2)).png" "$ICONSET/icon_${s}x${s}@2x.png"
+done
+iconutil -c icns "$ICONSET" -o "$WORK/Hibiki.icns"
+for arch in arm64 x86_64; do
+  B="$APP/python-$arch/Hibiki.app/Contents"
+  mkdir -p "$B/MacOS" "$B/Resources"
+  mv "$APP/python-$arch/bin/python${PY%.*}" "$B/MacOS/Hibiki"
+  ln -s "../Hibiki.app/Contents/MacOS/Hibiki" "$APP/python-$arch/bin/python${PY%.*}"
+  sed "s/@ID@/$ID/g; s/@PKGVER@/$PKGVER/g; s/@VERSION@/$VERSION/g" "$HERE/Info.plist" > "$B/Info.plist"
+  cp "$WORK/Hibiki.icns" "$B/Resources/"
+done
+
 # --- the suite ---
 ( cd "$REPO" && tar -cf - --exclude '__pycache__' --exclude '*.pyc' --exclude 'test_*.py' --exclude 'fake_*' \
     reaper_mcp brain gateway panel reaper scripts/reaper-watchdog.sh LICENSE README.md ) | tar -xf - -C "$APP/app"
@@ -55,18 +73,24 @@ echo "$VERSION" > "$APP/VERSION"
 cat > "$APP/bin/hibiki" << 'EOF'
 #!/bin/sh
 APP="/Library/Application Support/Hibiki"
-exec "$APP/python/bin/python3" -s -E "$APP/app/reaper_mcp/cli.py" "$@"
+exec "$APP/python/Hibiki.app/Contents/MacOS/Hibiki" -s -E "$APP/app/reaper_mcp/cli.py" "$@"
 EOF
 chmod 755 "$APP/bin/hibiki"
 
-# --- optional code signing of the bundled Mach-O files ---
+# --- code signing: Developer ID when given, else ad-hoc (seals Info.plist, so the app's identity is its bundle id) ---
 if [ -n "${DEV_ID_APP:-}" ]; then
-  find "$APP" -type f \( -perm -u+x -o -name '*.so' -o -name '*.dylib' \) -print0 |
+  find "$APP" -type f \( -perm -u+x -o -name '*.so' -o -name '*.dylib' \) -not -path '*/Hibiki.app/*' -print0 |
     while IFS= read -r -d '' f; do
       file -b "$f" | grep -q Mach-O || continue
       codesign --force --timestamp --options runtime --entitlements "$HERE/entitlements.plist" -s "$DEV_ID_APP" "$f"
     done
 fi
+sign=(-s -)
+[ -z "${DEV_ID_APP:-}" ] || sign=(-s "$DEV_ID_APP" --timestamp --options runtime --entitlements "$HERE/entitlements.plist")
+for arch in arm64 x86_64; do
+  codesign --force -i "$ID" "${sign[@]}" "$APP/python-$arch/Hibiki.app"
+  codesign --verify --strict "$APP/python-$arch/Hibiki.app"
+done
 
 # --- pkg ---
 sed "s/@VERSION@/$VERSION/g" "$HERE/resources/conclusion.html" > "$WORK/conclusion.html"
@@ -75,8 +99,17 @@ cp "$HERE/resources/welcome.html" "$WORK/resources/"
 mv "$WORK/conclusion.html" "$WORK/resources/"
 cp "$REPO/LICENSE" "$WORK/resources/LICENSE.txt"
 chmod -R go-w "$WORK/root"
-pkgbuild --root "$WORK/root" --scripts "$HERE/scripts" --identifier "$ID" --version "$PKGVER" \
-  --install-location / --ownership recommended "$WORK/core.pkg"
+# Installer would otherwise move a bundle to wherever another app with the same id lives, or skip it as "older"
+pkgbuild --analyze --root "$WORK/root" "$WORK/components.plist"
+"$host_py" -c 'import plistlib, sys
+p = sys.argv[1]
+c = plistlib.load(open(p, "rb"))
+for b in c:
+    b["BundleIsRelocatable"] = False
+    b["BundleIsVersionChecked"] = False
+plistlib.dump(c, open(p, "wb"))' "$WORK/components.plist"
+pkgbuild --root "$WORK/root" --component-plist "$WORK/components.plist" --scripts "$HERE/scripts" --identifier "$ID" \
+  --version "$PKGVER" --install-location / --ownership recommended "$WORK/core.pkg"
 sed "s/@PKGVER@/$PKGVER/g; s/@VERSION@/$VERSION/g; s/@ID@/$ID/g" "$HERE/Distribution.xml" > "$WORK/Distribution.xml"
 PKG="$OUT/Hibiki-$VERSION.pkg"
 productbuild --distribution "$WORK/Distribution.xml" --resources "$WORK/resources" --package-path "$WORK" \

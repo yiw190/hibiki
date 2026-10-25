@@ -35,6 +35,18 @@ jobs:
           test ! -L ~/Library/Logs/hibiki-install.log && test -O ~/Library/Logs/hibiki-install.log
       - name: doctor
         run: hibiki doctor
+      - name: services run as Hibiki.app, not a bare python3
+        run: |
+          app="/Library/Application Support/Hibiki/python/Hibiki.app"
+          codesign --verify --strict "$app"
+          codesign -dv "$app" 2>&1 | grep -q 'Identifier=io.github.yiw190.hibiki'
+          for l in reaper-mcp agent-gateway; do
+            f=~/Library/LaunchAgents/com.hibiki.$l.plist
+            plutil -extract ProgramArguments.0 raw "$f" | grep -q 'Hibiki.app/Contents/MacOS/Hibiki$'
+            plutil -extract AssociatedBundleIdentifiers.0 raw "$f" | grep -qx 'io.github.yiw190.hibiki'
+          done
+          ps -o comm= -p "$(pgrep -f gateway/agent_gateway.py | head -1)" | grep -q 'Hibiki.app/Contents/MacOS/Hibiki$'
+          "/Library/Application Support/Hibiki/python/bin/python3" -c 'import ssl, sqlite3, ctypes'
       - name: MCP answers over HTTP with the bundled Python
         run: |
           t=$(cat ~/.config/reaper-mcp/token)
