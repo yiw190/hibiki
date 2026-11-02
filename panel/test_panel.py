@@ -385,6 +385,29 @@ def test_failed_send_hands_text_back():
           and not p.S.active, (p.S.input, texts, p.S.err))
 
 
+
+def test_send_timeout_checks_delivery():
+    p = Panel(SESSION)
+    p.boot()
+    p.sse({"type": "connected", "isActive": False})
+    p.requests()
+    reqs = p.type_and_send("slow wake")
+    sent = find(reqs, "POST", "/sessions/s1/messages")
+    check("send: waits up to 300 s for the host", sent and " -m 300 " in sent[0].cmd, sent)
+    p.reply(sent[0], 0)
+    (look,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    p.reply(look, 200, [{"id": "u1", "type": "user", "content": {"text": "slow wake"}}])
+    texts = [m.text for m in p.lua_list(p.S.msgs)]
+    check("timed-out send that landed: no error, message kept", p.S.err is None and "slow wake" in texts
+          and p.S.input == "", (p.S.err, texts, p.S.input))
+
+    reqs = p.type_and_send("lost one")
+    p.reply(find(reqs, "POST", "/sessions/s1/messages")[0], 0)
+    (look,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    p.reply(look, 200, [{"id": "u1", "type": "user", "content": {"text": "slow wake"}}])
+    check("timed-out send that didn't land: text back, error shown",
+          p.S.input == "lost one" and p.S.err == "send failed (no answer from the host)", (p.S.input, p.S.err))
+
 def _composer(p):
     """Fake the composer field: ReaImGui's InputTextMultiline hands the buffer back only when it returns true; the EEL
     callback's variables live in FN. Returns the globals; set FIELD_ACTIVE / FN.ran / FN['#prev'] per frame."""

@@ -231,10 +231,10 @@ local reqn, pending = 0, {}
 local http_url, http_upload
 do
 local URL_OK = '^https?://[A-Za-z0-9.:-]+/[A-Za-z0-9._~/%%?=&-]*$' -- nothing a shell or cmd.exe would act on
-local function http_line(method, url, body, cb)
+local function http_line(method, url, body, cb, secs)
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
-  local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"' .. auth_args(url)
+  local args = '-s -m ' .. math.floor(secs or 60) .. ' -X ' .. method .. ' -H "Content-Type: application/json"' .. auth_args(url)
   if body then
     local f = io.open(b .. '.json', 'wb')
     if not f then mkdir(); f = io.open(b .. '.json', 'wb') end
@@ -251,9 +251,9 @@ local function http_line(method, url, body, cb)
   end
   pending[#pending + 1] = { b = b, cb = cb }
 end
-function http_url(method, url, body, cb)
+function http_url(method, url, body, cb, secs)
   if not url:match(URL_OK) then if cb then cb(0, '') end; return end
-  local ok, err = pcall(http_line, method, url, body, cb)
+  local ok, err = pcall(http_line, method, url, body, cb, secs)
   if not ok and cb then cb(0, tostring(err)) end
 end
 -- multipart upload of a local file (curl -F), same completion files as http_url
@@ -336,7 +336,9 @@ end
 if S.agent ~= '' then load_agent_session() end
 
 local function api(path) return HOST .. '/api/agents/' .. seg(S.agent) .. path end
-local function http(method, path, body, cb) http_url(method, api(path), body, cb) end
+local function http(method, path, body, cb, secs) http_url(method, api(path), body, cb, secs) end
+-- Gamut answers a send only once the agent has the message; waking a long idle session can take minutes
+local SEND_SECS = 300
 local function scroll() S.scroll = true end
 
 -- full = the whole transcript. Otherwise only what follows the last message that is certainly final (the one
@@ -753,13 +755,30 @@ local function deliver(payload, text, typed, files)
       else
         failed(('create session failed (%d)'):format(code))
       end
-    end)
+    end, SEND_SECS)
   else
     if not S.stream.file then stream_start() end -- the boot-time restore never ran (hosts were down then)
-    http('POST', '/sessions/' .. seg(S.sid) .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
+    local sid = S.sid
+    http('POST', '/sessions/' .. seg(sid) .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
       if gen ~= S.gen then return end
-      if code < 200 or code >= 300 then failed(('send failed (%d)'):format(code)) end
-    end)
+      if code >= 200 and code < 300 then return end
+      if code ~= 0 then return failed(('send failed (%d)'):format(code)) end
+      -- no answer in time: the host may still have taken it, so look before handing the text back
+      http('GET', '/sessions/' .. seg(sid) .. '/messages', nil, function(c2, body)
+        if gen ~= S.gen then return end
+        local list = c2 == 200 and decode(body)
+        if type(list) == 'table' and type(list.messages) == 'table' then list = list.messages end
+        if type(list) == 'table' then
+          for i = #list, math.max(1, #list - 20), -1 do
+            local m = list[i]
+            local t = type(m) == 'table' and m.type == 'user' and m.content
+            if type(t) == 'table' then t = t.text end
+            if t == payload then return refresh_messages(true) end
+          end
+        end
+        failed('send failed (no answer from the host)')
+      end)
+    end, SEND_SECS)
   end
 end
 

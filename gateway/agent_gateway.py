@@ -1535,12 +1535,14 @@ class Handler(BaseHTTPRequestHandler):
         if body and method == "POST" and "/sessions" in path and self.json:
             body = json.dumps(gamut_body(dict(self.json))).encode()
         stream = path.endswith("/stream")
+        # Gamut answers a send only once the agent has the message; waking a long idle session can take minutes
+        send = method == "POST" and (path.endswith("/sessions") or path.endswith("/messages"))
         req = urllib.request.Request(GAMUT + self.path, data=body, method=method)
         for h in ("Content-Type", "Accept"):
             if self.headers.get(h):
                 req.add_header(h, self.headers[h])
         try:
-            resp = urllib.request.urlopen(req, timeout=None if stream else 60)
+            resp = urllib.request.urlopen(req, timeout=None if stream else 300 if send else 60)
         except urllib.error.HTTPError as e:
             data = e.read()
             self.send_response(e.code)
